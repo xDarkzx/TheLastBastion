@@ -1,0 +1,33 @@
+# Lightweight agent image — runs on Raspberry Pi (ARM64)
+# No Playwright, no Tesseract, no heavy deps. Just the A2A agents + Bastion Protocol.
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libffi-dev libsodium-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install minimal deps for agents
+COPY requirements-agents.txt .
+RUN pip install --no-cache-dir -r requirements-agents.txt
+
+# Copy SDK
+COPY sdk/ sdk/
+RUN pip install --no-cache-dir -e sdk/
+
+# Copy agent code
+COPY agents/ agents/
+COPY core/__init__.py core/__init__.py
+COPY core/bastion_bus.py core/bastion_bus.py
+
+# Copy the combined runner
+COPY agents/a2a/agent_runner_bastion.py agents/a2a/agent_runner_bastion.py
+
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+# A2A ports (9001-9004) + Bastion ports (9101-9104)
+EXPOSE 9001 9002 9003 9004 9101 9102 9103 9104
+
+CMD ["python", "agents/a2a/agent_runner_bastion.py"]

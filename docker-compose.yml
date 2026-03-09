@@ -1,0 +1,89 @@
+services:
+  # ═══════════════════════════════════════════════════════
+  # INFRASTRUCTURE
+  # ═══════════════════════════════════════════════════════
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  db:
+    image: postgres:alpine
+    environment:
+      - POSTGRES_USER=industrial_admin
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-swarm_secret_2026}
+      - POSTGRES_DB=registry_base_vault
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U industrial_admin -d registry_base_vault"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ═══════════════════════════════════════════════════════
+  # API
+  # ═══════════════════════════════════════════════════════
+
+  api:
+    build: .
+    command: >
+      python3 -m uvicorn regional_core:app
+      --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    restart: always
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    environment:
+      REDIS_HOST: redis
+      DATABASE_URL: postgresql://industrial_admin:${POSTGRES_PASSWORD:-swarm_secret_2026}@db:5432/registry_base_vault
+      LLM_URL: http://host.docker.internal:11434/api/generate
+      LLM_MODEL: qwen2.5:7b-instruct
+      LLM_PROVIDER: ollama
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+      BASTION_HOST: ${BASTION_HOST:-192.168.87.39}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ═══════════════════════════════════════════════════════
+  # FRONTEND
+  # ═══════════════════════════════════════════════════════
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    restart: always
+    depends_on:
+      - api
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+      - ./frontend/index.html:/app/index.html
+    environment:
+      - VITE_API_BASE=
+
+volumes:
+  pgdata:
+
+networks:
+  default:
+    name: last-bastion

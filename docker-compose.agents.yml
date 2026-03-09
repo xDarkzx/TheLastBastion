@@ -1,0 +1,37 @@
+# Docker Compose for deploying agents on Raspberry Pi
+# Runs the 4 NZ food export supply chain agents:
+#   ProducerBot, ComplianceBot, LogisticsBot, BuyerBot
+# With both A2A (HTTP) and Bastion Protocol (TCP) endpoints
+#
+# Host ports remapped to avoid conflict with Portainer agent (9001)
+# Deploy via: docker compose up --build -d
+services:
+  agents:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bastion-agents
+    restart: unless-stopped
+    ports:
+      # A2A HTTP (JSON-RPC) — host 9201-9204 → container 9001-9004
+      - "9201:9001"
+      - "9202:9002"
+      - "9203:9003"
+      - "9204:9004"
+      # Bastion Protocol (TCP binary) — host 9301-9304 → container 9101-9104
+      - "9301:9101"
+      - "9302:9102"
+      - "9303:9103"
+      - "9304:9104"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REGISTRY_BASE_URL=${REGISTRY_BASE_URL:-http://192.168.87.1:8000}
+      - DEMO_DECAY_MODE=${DEMO_DECAY_MODE:-1}
+      - BASTION_ISSUER_PUB=${BASTION_ISSUER_PUB:-}
+      - BASTION_ISSUER_PRIV=${BASTION_ISSUER_PRIV:-}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; r = httpx.get('http://localhost:9001/.well-known/agent-card.json'); assert r.status_code == 200"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

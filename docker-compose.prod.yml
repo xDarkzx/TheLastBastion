@@ -1,0 +1,62 @@
+# Production override — use with: docker-compose -f docker-compose.yml -f docker-compose.prod.yml up
+#
+# Changes from dev:
+# - Frontend uses nginx (built static files) instead of Vite dev server
+# - API runs without --reload
+# - No volume mounts (uses built image)
+# - Environment variables injected from host (no defaults)
+# - Test agents included
+
+services:
+  api:
+    command: >
+      python3 -m uvicorn regional_core:app
+      --host 0.0.0.0 --port 8000 --workers 2
+    volumes: []  # No source mount in prod
+    environment:
+      REDIS_HOST: redis
+      DATABASE_URL: ${DATABASE_URL}
+      LLM_URL: ${LLM_URL:-http://host.docker.internal:11434/api/generate}
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct}
+      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      PASSPORT_SIGNING_KEY: ${PASSPORT_SIGNING_KEY}
+      BLOCKCHAIN_RPC_URL: ${BLOCKCHAIN_RPC_URL}
+      BLOCKCHAIN_PRIVATE_KEY: ${BLOCKCHAIN_PRIVATE_KEY}
+      PROOF_REGISTRY_ADDRESS: ${PROOF_REGISTRY_ADDRESS}
+      AGENT_REGISTRY_ADDRESS: ${AGENT_REGISTRY_ADDRESS}
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile.prod
+    ports:
+      - "80:80"
+    volumes: []  # No source mount in prod
+
+  # Test agents for external developers
+  echo-agent:
+    build: .
+    command: python3 -m agents.a2a.echo_agent
+    ports:
+      - "9010:9010"
+    restart: always
+    depends_on:
+      - api
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+
+  challenge-agent:
+    build: .
+    command: python3 -m agents.a2a.challenge_agent
+    ports:
+      - "9011:9011"
+    restart: always
+    depends_on:
+      - api
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"

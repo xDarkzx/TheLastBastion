@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  demo-agent:
+    build:
+      context: ..
+      dockerfile: demo_agent/Dockerfile
+    container_name: demo-agent
+    ports:
+      - "3100:3100"
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - BASTION_URL=${BASTION_URL:-http://host.docker.internal:8000}
+      - BORDER_POLICE_HOST=${BORDER_POLICE_HOST:-host.docker.internal}
+      - BORDER_POLICE_PORT=${BORDER_POLICE_PORT:-9200}
+      - PORT=3100
+    restart: unless-stopped

@@ -1,0 +1,213 @@
+@import "tailwindcss";
+
+@theme {
+  --color-workspace: #ffffff;
+  --color-surface: #f8fafc;
+  --color-sidebar: #0f172a;
+  --color-accent: #334155;
+  --color-primary: #0f172a;
+  --color-text-primary: #0f172a;
+  --color-text-secondary: #475569;
+  --color-text-muted: #94a3b8;
+  --color-border: #e2e8f0;
+  --color-border-strong: #cbd5e1;
+  --color-sn-blue: #0073bb;
+  --color-sn-blue-hover: #005a92;
+  --color-sn-orange: #ec7211;
+  --color-sn-orange-hover: #d4610a;
+  --color-sn-bg: #f2f3f3;
+  --color-sn-border: #d5dbdb;
+  --color-sn-text: #16191f;
+  --color-sn-text-secondary: #545b64;
+  --color-sn-link: #006192;
+}
+
+/* THE LAST BASTION DESIGN SYSTEM */
+* {
+  transition: transform 0.1s ease-out, background-color 0.1s ease-out !important;
+}
+
+body {
+  background-color: #ffffff !important;
+  color: #0f172a;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+.font-mono {
+  font-family: 'JetBrains Mono', monospace !important;
+}
+
+/* Clean UI Elements */
+.bg-workspace {
+  background-color: #ffffff !important;
+}
+
+.bg-surface {
+  background-color: #f8fafc !important;
+}
+
+.border-standard {
+  border: 1px solid #e2e8f0;
+}
+
+.border-strong {
+  border: 1px solid #0f172a;
+}
+
+/* Card System */
+.hive-card {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  padding: 24px;
+}
+
+.hive-card:hover {
+  border-color: #0f172a;
+}
+
+/* Button System */
+.btn-primary {
+  background: #0f172a;
+  color: #ffffff;
+  border: 1px solid #0f172a;
+  padding: 8px 16px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.btn-primary:hover {
+  background: #000000;
+}
+
+.btn-secondary {
+  background: #ffffff;
+  color: #0f172a;
+  border: 1px solid #e2e8f0;
+  padding: 8px 16px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.btn-secondary:hover {
+  background: #f8fafc;
+  border-color: #cbd5e1;
+}
+
+/* Inputs */
+.input-field {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: #0f172a;
+  width: 100%;
+}
+
+.input-field:focus {
+  outline: none;
+  border-color: #0f172a;
+}
+
+/* Telemetry & Mono Fields */
+.telemetry-item {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  padding: 4px 8px;
+  border-left: 2px solid #e2e8f0;
+}
+
+.telemetry-item.info {
+  border-color: #0f172a;
+}
+
+.telemetry-item.success {
+  border-color: #10b981;
+}
+
+.telemetry-item.warning {
+  border-color: #f59e0b;
+}
+
+.telemetry-item.error {
+  border-color: #ef4444;
+}
+
+/* Thin Scrollbar */
+.thin-scrollbar::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+.thin-scrollbar::-webkit-scrollbar-thumb {
+  background-color: #e2e8f0;
+}
+
+.thin-scrollbar::-webkit-scrollbar-track {
+  background-color: transparent;
+}
+
+/* Last Bastion Console Styles */
+.sn-btn-blue {
+  background-color: transparent;
+  color: var(--color-sn-link);
+  border: 1px solid var(--color-sn-link);
+  padding: 6px 12px;
+  border-radius: 2px;
+  font-weight: 700;
+  font-size: 14px;
+}
+
+.sn-btn-blue:hover {
+  background-color: #f1f8fe;
+}
+
+.sn-btn-orange {
+  background-color: var(--color-sn-orange);
+  color: white;
+  border: none;
+  padding: 6px 20px;
+  border-radius: 2px;
+  font-weight: 700;
+  font-size: 14px;
+  box-shadow: 0 1px 1px 0 rgba(0, 0, 0, 0.1);
+}
+
+.sn-btn-orange:hover {
+  background-color: var(--color-sn-orange-hover);
+}
+
+.sn-search-bar {
+  border: 1px solid var(--color-sn-border);
+  border-radius: 2px;
+  background: white;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  height: 32px;
+}
+
+.sn-table-header {
+  background-color: white;
+  border-bottom: 2px solid var(--color-sn-border);
+  color: var(--color-sn-text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.sn-table-row {
+  border-bottom: 1px solid var(--color-sn-border);
+  background-color: #fafafa;
+}
+
+.sn-table-row:hover {
+  background-color: #f2f3f3;
+}
