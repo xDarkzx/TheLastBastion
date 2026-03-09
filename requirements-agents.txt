@@ -1,0 +1,7 @@
+# Minimal deps for A2A agents + Bastion Protocol on Raspberry Pi
+uvicorn>=0.27.0
+pydantic>=2.6.1
+httpx>=0.26.0
+a2a-sdk[http-server]>=0.3.20
+pynacl>=1.5.0
+msgpack>=1.0.0

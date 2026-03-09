@@ -1,0 +1,61 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.eggs
+.eggs/
+venv/
+.venv/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Playwright & Testing
+playwright-report/
+test-results/
+coverage/
+
+# Log Files
+*.webp
+logs/
+*.log
+.system_generated/
+tmp/
+.tmp/
+cache/
+
+# Docker
+.docker/
+docker-volumes/
+
+# Keys and secrets
+*.keys.json
+.bastion_keys.json
+
+# Private files — never push
+CLAUDE.md
+.claude/
+.gemini/
+.geminiignore
+deploy_to_pi.py
+deploy-agents-to-pi.ps1
+data/

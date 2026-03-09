@@ -1,0 +1,29 @@
+{
+    "name": "registry-base-proof-registry",
+    "version": "1.0.0",
+    "description": "The Last Bastion on-chain proof registry — stores verification verdicts immutably on Polygon",
+    "scripts": {
+        "compile": "hardhat compile",
+        "deploy": "hardhat run scripts/deploy.js --network amoy",
+        "deploy:local": "hardhat run scripts/deploy.js --network hardhat",
+        "anchor:test": "hardhat run scripts/anchor-test.js --network amoy",
+        "verify": "hardhat verify --network amoy",
+        "balance": "hardhat run scripts/check-balance.js --network amoy"
+    },
+    "keywords": [
+        "blockchain",
+        "polygon",
+        "verification",
+        "proof",
+        "registry-base"
+    ],
+    "license": "MIT",
+    "devDependencies": {
+        "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+        "hardhat": "^2.19.2"
+    },
+    "dependencies": {
+        "dotenv": "^16.3.1",
+        "ethers": "^6.9.0"
+    }
+}
