@@ -17,7 +17,7 @@ This isn't theoretical:
 - **CSA** published guidance on agentic AI threats including identity spoofing and data poisoning
 - The market for AI agent security is projected to hit $236B by 2030 (WEF)
 
-Nobody has built the infrastructure to solve this. Until now.
+Nobody has built the infrastructure to solve this. The Last Bastion is a prototype working toward it.
 
 ---
 
@@ -56,7 +56,7 @@ Every verification produces a tamper-evident proof record. These chain together 
 
 ### Open Sandbox
 
-Send your agent to be tested. The sandbox runs real attacks against it:
+Send your agent to be tested. The sandbox runs simulated attacks against it:
 - Prompt injection
 - Identity spoofing
 - Sybil flooding
@@ -99,7 +99,7 @@ Your agent gets a trust score based on what it survives.
                          │                                  │
                          │    ┌─────────┐                   │
   Sandbox test ─────────►│   │ Attack   │  6 attack types   │
-                         │    │Simulator│  real execution   │
+                         │    │Simulator│  simulated execution   │
                          │    └─────────┘                   │
                          └─────────────────────────────────┘
 ```
@@ -108,7 +108,7 @@ Your agent gets a trust score based on what it survives.
 
 ## What's Built
 
-This isn't a whitepaper. Everything listed below is implemented and working.
+Everything listed below is implemented as a working prototype.
 
 ### Security Infrastructure
 - **10-check agent verification pipeline** — identity, crypto challenge, behavioral, anti-Sybil, payload, network, history, anomaly
@@ -132,13 +132,13 @@ This isn't a whitepaper. Everything listed below is implemented and working.
   - `SwarmAgentRegistry` — agent identity, reputation, service marketplace ([0xc917...0D7D](https://amoy.polygonscan.com/address/0xc9177baBF86FF16794AABd1a2169f898986a0D7D))
 
 ### Agent Network
-- **A2A Protocol** (Linux Foundation standard) — real agent-to-agent communication
-- **4 demo agents** — Producer, Compliance, Logistics, Buyer — running a supply chain verification workflow
+- **A2A Protocol** (Linux Foundation standard) — agent-to-agent communication
+- **4 demo agents** — Producer, Compliance, Logistics, Buyer — demonstrating a supply chain verification workflow
 - **Agent Cards** — standardised discovery (/.well-known/agent.json)
 
 ### Platform
 - **FastAPI backend** with full API docs at `/docs`
-- **React dashboard** — real-time monitoring, protocol feed, sandbox controls
+- **React dashboard** — monitoring, protocol feed, sandbox controls
 - **Python SDK** — client, gateway middleware, MCP tools
 - **Docker orchestration** — 4 services, one command to start
 
@@ -150,7 +150,7 @@ This isn't a whitepaper. Everything listed below is implemented and working.
 
 ```bash
 # 1. Clone
-git clone https://github.com/YOUR_USERNAME/the-last-bastion.git
+git clone https://github.com/xDarkzx/TheLastBastion.git
 cd the-last-bastion
 
 # 2. Configure
@@ -252,7 +252,7 @@ The agent economy is being built without security infrastructure. Every major fr
 - Tamper-evident audit trails (can we prove what happened?)
 - Cross-platform trust (works across any agent framework)
 
-This is what NIST, CSA, and WEF have identified as critical gaps. The Last Bastion is a working implementation that addresses them.
+These are the gaps NIST, CSA, and WEF have identified as critical. The Last Bastion is a prototype implementation working toward addressing them.
 
 ---
 

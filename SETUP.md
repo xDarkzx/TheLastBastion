@@ -40,7 +40,7 @@ That's it. No Python, no Node.js, no package managers. Docker handles everything
 ## 1. Clone the Repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/the-last-bastion.git
+git clone https://github.com/xDarkzx/TheLastBastion.git
 cd the-last-bastion
 ```
 
@@ -114,7 +114,7 @@ Open [http://localhost:5173](http://localhost:5173) and you should see The Last 
 
 ## 5. Run the Test Suite
 
-The test suite runs 19 sequential phases covering every system component. Run it inside the API container:
+The test suite runs 25 sequential phases covering every system component. Run it inside the API container:
 
 ```bash
 docker-compose exec api python scripts/run_backend_test.py

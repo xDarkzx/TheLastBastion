@@ -1,6 +1,6 @@
 # Last Bastion SDK
 
-Border police for agent ecosystems. Verify agents, issue cryptographic passports, and protect your endpoints from untrusted AI agents.
+SDK for agent trust verification. Verify agents, issue cryptographic passports, and protect your endpoints from untrusted AI agents.
 
 ## Install
 
@@ -22,7 +22,7 @@ pip install lastbastion[all]
 ```python
 from lastbastion import LastBastionClient
 
-async with LastBastionClient(base_url="https://api.thelastbastion.io") as client:
+async with LastBastionClient(base_url="http://localhost:8000") as client:
     # Generate Ed25519 keypair
     public_key, private_key = client.generate_keypair()
 
@@ -49,7 +49,7 @@ Register your agent, get verified through a 10-check pipeline, and receive a sig
 ```python
 from lastbastion import LastBastionClient
 
-async with LastBastionClient(base_url="https://api.thelastbastion.io") as client:
+async with LastBastionClient(base_url="http://localhost:8000") as client:
     # Generate or bring your own Ed25519 keypair
     public_key, private_key = client.generate_keypair()
 
@@ -100,7 +100,7 @@ Give any MCP-compatible AI agent the ability to verify itself and check data.
 from lastbastion.mcp_tools import create_lastbastion_mcp
 
 mcp = create_lastbastion_mcp(
-    base_url="https://api.thelastbastion.io",
+    base_url="http://localhost:8000",
 )
 
 # Tools available to the AI agent:
@@ -164,7 +164,7 @@ else:
 
 ## Agent Passport
 
-A passport is a signed JWT that proves an agent was verified by The Last Bastion. It contains:
+A passport is a signed JWT indicating that an agent completed verification through The Last Bastion. It contains:
 
 | Category | Fields |
 |----------|--------|
@@ -192,7 +192,7 @@ The gateway works without calling The Last Bastion server. You only need the iss
 
 ```python
 # Get the issuer's public key once
-# GET https://api.thelastbastion.io/m2m/passport/issuer-key
+# GET http://localhost:8000/m2m/passport/issuer-key
 # {"public_key": "abc123...", "algorithm": "EdDSA"}
 
 gateway = LastBastionGateway(

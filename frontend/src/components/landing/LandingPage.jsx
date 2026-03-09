@@ -63,7 +63,7 @@ const LandingPage = () => {
             <a href="#missions" className="text-[13px] text-slate-500 hover:text-slate-900 transition-colors font-medium">What We Do</a>
             <a href="#why" className="text-[13px] text-slate-500 hover:text-slate-900 transition-colors font-medium">Why Independent</a>
             <a href="#technology" className="text-[13px] text-slate-500 hover:text-slate-900 transition-colors font-medium">Technology</a>
-            <button onClick={() => navigate('/demo')} className="text-[13px] text-slate-500 hover:text-slate-900 transition-colors font-medium">Live Agent Demo</button>
+            <button onClick={() => navigate('/demo')} className="text-[13px] text-slate-500 hover:text-slate-900 transition-colors font-medium">Agent Demo</button>
           </div>
           <button
             onClick={() => navigate('/dashboard')}
@@ -119,7 +119,7 @@ const LandingPage = () => {
               onClick={() => navigate('/dashboard')}
               className="group px-7 py-3 bg-slate-900 hover:bg-slate-800 text-white rounded-md font-semibold text-[13px] tracking-wide transition-all flex items-center gap-2"
             >
-              See The Live System
+              Explore The System
               <ArrowRight className="w-4 h-4 group-hover:translate-x-0.5 transition-transform" />
             </button>
             <a
@@ -328,7 +328,7 @@ const LandingPage = () => {
               {
                 icon: Lock,
                 title: 'Immutable proof, not promises',
-                desc: 'Every verification verdict is recorded on a Merkle-chain ledger where each record\'s hash chains to the previous one. Any tampering breaks all subsequent records. Verdicts are forged as immutable evidence onto multiple blockchains — public infrastructure that no single entity controls.',
+                desc: 'Every verification verdict is recorded on a Merkle-chain ledger where each record\'s hash chains to the previous one. Any tampering breaks all subsequent records. Verdicts can be anchored on the Polygon Amoy testnet — public infrastructure that no single entity controls.',
               },
               {
                 icon: Eye,
@@ -343,7 +343,7 @@ const LandingPage = () => {
               {
                 icon: GitBranch,
                 title: 'Verifiable by anyone, controlled by no one',
-                desc: 'Smart contracts deployed across multiple blockchains. Any agent, developer, or auditor can query them to verify a trust passport or data proof — for free, without our permission, without an API key. Once a verdict is on-chain, even we can\'t change it. That\'s the point.',
+                desc: 'Smart contracts deployed on the Polygon Amoy testnet. Any agent, developer, or auditor can query them to verify a trust passport or data proof — for free, without our permission, without an API key. Once a verdict is on-chain, even we can\'t change it. That\'s the point.',
               },
             ].map((item, i) => (
               <FadeIn key={item.title} delay={i * 0.08}>
@@ -364,7 +364,7 @@ const LandingPage = () => {
           <FadeIn className="text-center mb-14">
             <p className="text-[12px] font-semibold text-slate-400 uppercase tracking-widest mb-3">Test Your Agents</p>
             <h2 className="text-3xl md:text-4xl font-bold tracking-tight mb-5">
-              Not a whitepaper. A sandbox you can run today.
+              A sandbox you can run locally.
             </h2>
             <p className="text-base text-slate-500 max-w-2xl mx-auto leading-relaxed">
               Bring your agents. Put them through the pipeline. See exactly how they score across
@@ -388,8 +388,8 @@ const LandingPage = () => {
                 },
                 {
                   step: '03',
-                  title: 'Get real trust verdicts',
-                  desc: 'Your agents earn trust scores through real verification — cryptographic challenges, behavioral analysis, payload forensics. Every result is recorded on an immutable ledger.',
+                  title: 'Get trust verdicts',
+                  desc: 'Your agents earn trust scores through simulated verification — cryptographic challenges, behavioral analysis, payload forensics. Every result is recorded on an immutable ledger.',
                 },
               ].map((item, i) => (
                 <motion.div
@@ -444,9 +444,9 @@ const LandingPage = () => {
             {[
               { label: 'Agent Protocol', detail: 'A2A Standard', sub: 'Linux Foundation governed', icon: Bot },
               { label: 'Proof Ledger', detail: 'Merkle Chain', sub: 'Append-only, tamper-evident', icon: Layers },
-              { label: 'Blockchain', detail: 'Multi-Chain', sub: 'Immutable evidence across chains', icon: Hexagon },
+              { label: 'Blockchain', detail: 'Polygon Amoy', sub: 'Testnet proof anchoring', icon: Hexagon },
               { label: 'Signing', detail: 'Ed25519 + SHA-256', sub: 'Non-repudiation proofs', icon: Lock },
-              { label: 'Forensics', detail: '10 Analyzers', sub: 'ELA, DCT, copy-move, AI detection', icon: Fingerprint },
+              { label: 'Forensics', detail: '7 Analyzers', sub: 'ELA, noise, copy-move, lighting, metadata', icon: Fingerprint },
               { label: 'Storage', detail: 'PostgreSQL', sub: 'Full audit trail', icon: Database },
               { label: 'File Support', detail: '8 Formats', sub: 'PDF, images, Excel, Word, CSV', icon: FileText },
               { label: 'Consensus', detail: 'Dual-Agent', sub: 'Two agents must agree', icon: GitBranch },
@@ -554,7 +554,7 @@ const LandingPage = () => {
                 that treats every agent the same regardless of where it came from.
               </p>
               <p className="text-slate-700 font-medium">
-                The technology is built. The sandbox is open. The verification pipeline is running.
+                The prototype is built. The sandbox is functional. The verification pipeline is running locally.
                 We don't know exactly what shape the future takes —
                 but we want to be ready to help when it arrives.
               </p>
@@ -574,7 +574,7 @@ const LandingPage = () => {
             </h2>
             <p className="text-base text-slate-500 max-w-xl mx-auto mb-8 leading-relaxed">
               A neutral verification layer for autonomous agents — independent,
-              governed by immutable evidence forged across multiple blockchains,
+              governed by immutable evidence anchored on blockchain,
               and open for anyone to query. We're not there yet. But we're building it.
             </p>
             <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
@@ -598,9 +598,9 @@ const LandingPage = () => {
             <span className="text-xs font-semibold text-slate-400">The Last Bastion</span>
           </div>
           <div className="flex items-center gap-6 text-[11px] text-slate-400">
-            <span>Multi-Chain Proofs</span>
+            <span>Testnet Proofs</span>
             <span>A2A Protocol</span>
-            <span>Global Infrastructure</span>
+            <span>Open Source</span>
           </div>
           <div className="text-[11px] text-slate-300">
             {new Date().getFullYear()} The Last Bastion

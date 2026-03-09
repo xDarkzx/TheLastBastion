@@ -383,7 +383,7 @@ The SDK and service provide the judgement: trust, policy, escalation, reputation
 | Large payloads | Multipart + base64 (33% bloat) | Native streaming (zero bloat) |
 | Connection model | Request/response (stateless) | Persistent (authenticated session) |
 | Replay protection | None (must implement yourself) | Monotonic sequences + nonce + timestamp |
-| Attack surface | Entire OWASP Top 10 | Zero -- tools don't speak this protocol |
+| Attack surface | Entire OWASP Top 10 | Reduced -- binary protocol eliminates most web attack vectors |
 | Forward secrecy | Depends on TLS config | Mandatory (ephemeral DH) |
 | Crypto fallbacks | TLS allows weak ciphers | None -- PyNaCl or nothing |
 
