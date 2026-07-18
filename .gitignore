@@ -50,8 +50,10 @@ docker-volumes/
 # Keys and secrets
 *.keys.json
 .bastion_keys.json
+.agent_keys/
 scripts/.bench_*.json
 scripts/bastion_bench_report.json
+scripts/.rigorous_trial_*.json
 
 # Private files — never push
 CLAUDE.md

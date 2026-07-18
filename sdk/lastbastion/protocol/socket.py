@@ -24,6 +24,7 @@ Hard dependencies: pynacl, msgpack.
 import asyncio
 import hashlib
 import logging
+import time
 import weakref
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Dict, List, Optional
@@ -136,12 +137,28 @@ class AgentConnection:
         max_stream_size: int = DEFAULT_MAX_STREAM_SIZE,
         on_frame_sent: Optional[Callable] = None,
         on_frame_received: Optional[Callable] = None,
+        trusted_transport: bool = False,
     ):
+        """
+        trusted_transport: when True, DATA/PING/PONG/CLOSE frames skip NaCl
+        SecretBox encryption entirely -- zero encryption, zero integrity/MAC
+        on the payload. Encryption defends against a hostile network between
+        two points; if the transport itself is one you control end-to-end
+        (same host, a private network segment with no untrusted hop), there
+        is no such network to defend against and the crypto is pure cost
+        with no security benefit -- measured as ~60% of Bastion's per-message
+        CPU cost. The handshake (identity proof, key pinning) is completely
+        unaffected either way. This is opt-in and defaults False: it must be
+        a deliberate choice about the transport, not an assumption.
+        """
         self._reader = reader
         self._writer = writer
         self._encoder = encoder
         self._decoder = decoder
         self._session = session_keys
+        self._trusted_transport = trusted_transport
+        self._encrypt_func = None if trusted_transport else self._session.encrypt
+        self._decrypt_func = None if trusted_transport else self._session.decrypt
         self.peer = peer
         self.local_passport = local_passport
         self._closed = False
@@ -150,8 +167,28 @@ class AgentConnection:
         self._recv_lock = asyncio.Lock()
         self._max_stream_size = max_stream_size
         self.metrics = ProtocolMetrics()
+        self._last_activity = time.monotonic()
+        self._last_ping_sent = time.monotonic()
         self._on_frame_sent = on_frame_sent
         self._on_frame_received = on_frame_received
+        self._disable_nagle()
+
+    def _disable_nagle(self) -> None:
+        """
+        Disables Nagle's algorithm (TCP_NODELAY) on the underlying socket.
+        Frames are already explicitly length-prefixed and written as a single
+        buffered write+drain, so there's nothing to gain from Nagle batching
+        them with a future write -- only latency to lose on small messages.
+        Best-effort: some transports (e.g. in tests) may not expose a real
+        socket, so failures here are non-fatal.
+        """
+        try:
+            import socket as _socket
+            sock = self._writer.get_extra_info("socket")
+            if sock is not None:
+                sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+        except (OSError, AttributeError):
+            pass
 
     @property
     def is_closed(self) -> bool:
@@ -161,7 +198,7 @@ class AgentConnection:
         """Send a DATA frame with a dict payload."""
         if self._closed:
             raise ConnectionError("Connection is closed")
-        frame = self._encoder.encode_data(data, self._session.encrypt)
+        frame = self._encoder.encode_data(data, self._encrypt_func)
         await self._write_frame(frame)
 
     async def recv(self) -> dict:
@@ -177,7 +214,7 @@ class AgentConnection:
             elif frame.msg_type == FrameType.CLOSE:
                 # Bidirectional CLOSE: send CLOSE back
                 try:
-                    close_frame = self._encoder.encode_close(self._session.encrypt)
+                    close_frame = self._encoder.encode_close(self._encrypt_func)
                     await self._write_frame_raw(close_frame)
                 except Exception:
                     pass
@@ -214,7 +251,7 @@ class AgentConnection:
             "content_hash": content_hash,
         })
         start_frame = self._encoder.encode(
-            FrameType.STREAM_START, start_payload, self._session.encrypt
+            FrameType.STREAM_START, start_payload, self._encrypt_func
         )
         await self._write_frame(start_frame)
 
@@ -228,7 +265,7 @@ class AgentConnection:
                 "data": chunk,
             })
             chunk_frame = self._encoder.encode(
-                FrameType.STREAM_CHUNK, chunk_payload, self._session.encrypt
+                FrameType.STREAM_CHUNK, chunk_payload, self._encrypt_func
             )
             await self._write_frame(chunk_frame)
 
@@ -238,7 +275,7 @@ class AgentConnection:
             "final_hash": content_hash,
         })
         end_frame = self._encoder.encode(
-            FrameType.STREAM_END, end_payload, self._session.encrypt
+            FrameType.STREAM_END, end_payload, self._encrypt_func
         )
         await self._write_frame(end_frame)
 
@@ -297,7 +334,7 @@ class AgentConnection:
         if self._closed:
             return
         try:
-            close_frame = self._encoder.encode_close(self._session.encrypt)
+            close_frame = self._encoder.encode_close(self._encrypt_func)
             await self._write_frame_raw(close_frame)
             # Wait briefly for peer's CLOSE response
             try:
@@ -315,27 +352,55 @@ class AgentConnection:
         self._session.destroy()
         self._writer.close()
 
+    # How often the watchdog checks for a stalled connection. Deliberately
+    # tighter than PING_INTERVAL_SECONDS -- this cadence only costs a cheap
+    # background wakeup, unlike the old per-read wait_for it replaces, which
+    # cost real overhead on every single frame.
+    _WATCHDOG_CHECK_INTERVAL_SECONDS = 2.0
+
     def start_keepalive(self):
-        """Start background PING/PONG loop with timeout enforcement."""
+        """Start background PING/PONG + dead-connection watchdog loop."""
         self._ping_task = asyncio.ensure_future(self._keepalive_loop())
 
     async def _keepalive_loop(self):
-        """Send PING every interval. Enforce PONG timeout."""
+        """
+        Two jobs on one background loop:
+        1. Watchdog: if no frame has arrived from the peer in longer than
+           FRAME_TIMEOUT_SECONDS + PING_INTERVAL_SECONDS, force-close the
+           connection. This is what replaced the old per-read
+           asyncio.wait_for() timeout in _read_frame_raw() -- same bounded-
+           time dead-peer guarantee, but checked periodically in the
+           background instead of wrapping every single read.
+        2. Keepalive: send a PING every PING_INTERVAL_SECONDS so an otherwise
+           idle-but-healthy connection doesn't look stalled to the peer.
+        """
         while not self._closed:
-            await asyncio.sleep(PING_INTERVAL_SECONDS)
+            await asyncio.sleep(self._WATCHDOG_CHECK_INTERVAL_SECONDS)
             if self._closed:
                 break
-            try:
-                ping = self._encoder.encode_ping(self._session.encrypt)
-                await self._write_frame(ping)
-                self.metrics.pings_sent += 1
-            except Exception:
+
+            idle = time.monotonic() - self._last_activity
+            if idle > FRAME_TIMEOUT_SECONDS + PING_INTERVAL_SECONDS:
                 self._closed = True
+                try:
+                    self._writer.close()
+                except Exception:
+                    pass
                 break
+
+            if time.monotonic() - self._last_ping_sent >= PING_INTERVAL_SECONDS:
+                try:
+                    ping = self._encoder.encode_ping(self._encrypt_func)
+                    await self._write_frame(ping)
+                    self.metrics.pings_sent += 1
+                    self._last_ping_sent = time.monotonic()
+                except Exception:
+                    self._closed = True
+                    break
 
     async def _send_pong(self):
         """Respond to a PING."""
-        pong = self._encoder.encode_pong(self._session.encrypt)
+        pong = self._encoder.encode_pong(self._encrypt_func)
         await self._write_frame(pong)
 
     async def _write_frame(self, frame: BastionFrame):
@@ -376,33 +441,33 @@ class AgentConnection:
         """
         Read a frame from the wire (no lock -- internal use).
 
-        Both reads (length prefix + body) share ONE asyncio.wait_for instead
-        of one each -- wait_for isn't free (measured ~20us of task/timer
-        setup overhead per call on top of the read itself), and calling it
-        twice per frame, on both ends of every round trip, was a real,
-        measured contributor to DATA-frame latency. Using the more generous
-        of the two original timeouts (FRAME_TIMEOUT_SECONDS +
-        PING_INTERVAL_SECONDS) for the combined operation is strictly more
-        permissive than before, not less -- it can't newly time out a read
-        that would previously have succeeded, only continues to catch a
-        genuinely stalled connection.
+        No per-read asyncio.wait_for() here -- measured at ~15-20us of real,
+        avoidable overhead per call (task + timer setup), and it ran on every
+        single frame read on both ends of every round trip. A hung/dead peer
+        is instead caught by the watchdog in _keepalive_loop(), which
+        periodically checks how long it's been since a frame last arrived and
+        force-closes the connection if that exceeds the same timeout this
+        used to enforce inline. Closing self._writer from that separate task
+        reliably unblocks a read that's stuck here (verified: raises
+        IncompleteReadError, the same exception this already handles) --
+        same bounded-time dead-connection guarantee, without paying the
+        wait_for tax on every single healthy read.
         """
         try:
-            frame_data = await asyncio.wait_for(
-                self._read_length_and_body(),
-                timeout=FRAME_TIMEOUT_SECONDS + PING_INTERVAL_SECONDS,
-            )
-            frame_length = len(frame_data)
-        except asyncio.TimeoutError:
+            frame_data = await self._read_length_and_body()
+        except (asyncio.IncompleteReadError, ConnectionError, OSError) as e:
+            # Covers both a clean EOF (IncompleteReadError) and a forced
+            # close from the watchdog, which platforms report differently --
+            # e.g. ConnectionResetError (a ConnectionError subclass) on
+            # Windows when the watchdog closes the socket out from under a
+            # pending read. Same outcome either way: the connection is dead.
             self._closed = True
-            raise ConnectionError("Frame timeout -- incomplete frame received")
-        except asyncio.IncompleteReadError:
-            self._closed = True
-            raise ConnectionError("Connection lost during frame read")
+            raise ConnectionError("Connection lost during frame read") from e
 
-        frame = self._decoder.decode(frame_data, self._session.decrypt)
+        self._last_activity = time.monotonic()
+        frame = self._decoder.decode(frame_data, self._decrypt_func)
         self.metrics.frames_received += 1
-        self.metrics.bytes_received += frame_length + 4
+        self.metrics.bytes_received += len(frame_data) + 4
         if frame.msg_type == FrameType.PONG:
             self.metrics.pongs_received += 1
         if self._on_frame_received:
@@ -785,6 +850,7 @@ class DirectAgentSocket:
         max_stream_size: int = DEFAULT_MAX_STREAM_SIZE,
         on_frame_sent: Optional[Callable] = None,
         on_frame_received: Optional[Callable] = None,
+        trusted_transport: bool = False,
     ):
         """
         Connect using DIRECT mode.
@@ -794,6 +860,16 @@ class DirectAgentSocket:
         rejection (ticket expired/already used/unknown to this server), this
         automatically reconnects fresh with a full DIRECT handshake instead
         -- callers don't need to implement that fallback themselves.
+
+        trusted_transport: opt-in, defaults False. When True, post-handshake
+        DATA/PING/PONG/CLOSE frames skip NaCl SecretBox encryption entirely
+        -- see AgentConnection's docstring for the tradeoff. Only set this
+        for connections you know stay within a network you control end-to-
+        end (e.g. same host, a private network segment with no untrusted
+        hop) -- the handshake/identity verification is unaffected either
+        way, only the ongoing traffic's confidentiality/integrity is. Must
+        match on both ends of the connection (server's listen() call needs
+        the same setting) or decode will simply fail on garbled payloads.
 
         Returns (connection, next_ticket, resumption_secret).
         next_ticket is None if the server isn't configured for resumption
@@ -811,20 +887,20 @@ class DirectAgentSocket:
             try:
                 return await DirectAgentSocket._connect_resume(
                     host, port, signing_key, resume_ticket, resumption_secret,
-                    max_stream_size, on_frame_sent, on_frame_received,
+                    max_stream_size, on_frame_sent, on_frame_received, trusted_transport,
                 )
             except (ValueError, ConnectionError, OSError) as e:
                 logger.info(f"Resumption failed ({e}), falling back to fresh DIRECT handshake")
 
         return await DirectAgentSocket._connect_fresh(
             host, port, agent_id, public_key, signing_key, trust_store, tofu,
-            max_stream_size, on_frame_sent, on_frame_received,
+            max_stream_size, on_frame_sent, on_frame_received, trusted_transport,
         )
 
     @staticmethod
     async def _connect_fresh(
         host, port, agent_id, public_key, signing_key, trust_store, tofu,
-        max_stream_size, on_frame_sent, on_frame_received,
+        max_stream_size, on_frame_sent, on_frame_received, trusted_transport=False,
     ):
         reader, writer = await asyncio.open_connection(host, port)
         try:
@@ -879,6 +955,7 @@ class DirectAgentSocket:
                 max_stream_size=max_stream_size,
                 on_frame_sent=on_frame_sent,
                 on_frame_received=on_frame_received,
+                trusted_transport=trusted_transport,
             )
             conn.start_keepalive()
             return conn, result.session_ticket, result.resumption_secret
@@ -890,7 +967,7 @@ class DirectAgentSocket:
     @staticmethod
     async def _connect_resume(
         host, port, signing_key, ticket, resumption_secret,
-        max_stream_size, on_frame_sent, on_frame_received,
+        max_stream_size, on_frame_sent, on_frame_received, trusted_transport=False,
     ):
         import os as _os
 
@@ -937,6 +1014,7 @@ class DirectAgentSocket:
                 max_stream_size=max_stream_size,
                 on_frame_sent=on_frame_sent,
                 on_frame_received=on_frame_received,
+                trusted_transport=trusted_transport,
             )
             conn.start_keepalive()
             return conn, next_ticket, resumption_secret
@@ -959,6 +1037,7 @@ class DirectAgentSocket:
         max_stream_size: int = DEFAULT_MAX_STREAM_SIZE,
         on_frame_sent: Optional[Callable] = None,
         on_frame_received: Optional[Callable] = None,
+        trusted_transport: bool = False,
     ) -> "DirectAgentSocketServer":
         """
         Create a server that accepts incoming DIRECT-mode connections.
@@ -970,6 +1049,9 @@ class DirectAgentSocket:
         the ResumptionResponder used for resumed connections (see handshake.py
         -- resumed sessions skip full re-verification by design, so wire this
         if a revoked agent must be locked out before its tickets naturally expire).
+        trusted_transport: opt-in, defaults False -- see DirectAgentSocket.connect's
+        docstring. Must match what clients pass to connect(), or decode will
+        simply fail on garbled payloads (one side encrypting, the other not).
         """
         return DirectAgentSocketServer(
             agent_id=agent_id,
@@ -984,6 +1066,7 @@ class DirectAgentSocket:
             max_stream_size=max_stream_size,
             on_frame_sent=on_frame_sent,
             on_frame_received=on_frame_received,
+            trusted_transport=trusted_transport,
         )
 
 
@@ -1004,6 +1087,7 @@ class DirectAgentSocketServer:
         max_stream_size: int = DEFAULT_MAX_STREAM_SIZE,
         on_frame_sent: Optional[Callable] = None,
         on_frame_received: Optional[Callable] = None,
+        trusted_transport: bool = False,
     ):
         self.agent_id = agent_id
         self.public_key = public_key
@@ -1014,6 +1098,7 @@ class DirectAgentSocketServer:
         self.tofu = tofu
         self.ticket_key = ticket_key
         self.revocation_check = revocation_check
+        self.trusted_transport = trusted_transport
         self._max_stream_size = max_stream_size
         self._handler = None
         self._server = None
@@ -1132,6 +1217,7 @@ class DirectAgentSocketServer:
             session_keys=result.session_keys, peer=peer, local_passport=local_passport,
             max_stream_size=self._max_stream_size,
             on_frame_sent=self._on_frame_sent, on_frame_received=self._on_frame_received,
+            trusted_transport=self.trusted_transport,
         )
 
     async def _handle_resume(self, reader, writer, resume_frame) -> Optional[AgentConnection]:
@@ -1160,6 +1246,7 @@ class DirectAgentSocketServer:
             session_keys=result.session_keys, peer=peer, local_passport=None,
             max_stream_size=self._max_stream_size,
             on_frame_sent=self._on_frame_sent, on_frame_received=self._on_frame_received,
+            trusted_transport=self.trusted_transport,
         )
 
     async def _send_error(self, writer, message: str):

@@ -31,7 +31,12 @@ jmespath==1.0.1
 croniter==1.4.1
 
 # A2A Protocol (agent-to-agent communication)
-a2a-sdk[http-server]>=0.3.20
+# Pinned below 1.0 -- a2a-sdk 1.x removed/renamed `DataPart` from a2a.types,
+# which every agent in agents/a2a/*.py imports directly. That break was
+# confirmed by an actual container boot failure (unpinned >=0.3.20 resolved
+# to 1.1.1). Revisit the >=0.3.20,<1.0.0 pin only alongside an audit of what
+# 1.x actually renamed DataPart to.
+a2a-sdk[http-server]>=0.3.20,<1.0.0
 
 # Bastion Protocol (binary wire protocol + crypto)
 pynacl>=1.5.0

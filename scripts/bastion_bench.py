@@ -178,6 +178,18 @@ async def cmd_serve(args):
                 msg = await conn.recv()
                 stats["messages"] += 1
                 stats["bytes"] += len(json.dumps(msg).encode())
+                if msg.get("bulk"):
+                    # Fire-and-forget bulk phase: deliberately do NOT echo.
+                    # Echoing here would deadlock -- the bulk-send client
+                    # never drains responses (that's the point: it measures
+                    # pure one-directional send throughput), so if the
+                    # server wrote an echo per message, both sides' TCP
+                    # send buffers would eventually fill with neither side
+                    # reading, and both directions' drain() calls would
+                    # block forever once payload volume exceeds OS buffer
+                    # size. Confirmed via direct reproduction (500 msg
+                    # round-trip fine, 20000 msg bulk hung indefinitely).
+                    continue
                 await conn.send({"echo": msg})
         except Exception:
             pass
@@ -185,7 +197,7 @@ async def cmd_serve(args):
     server = DirectAgentSocket.listen(
         agent_id=args.agent_id, public_key=pub, signing_key=priv,
         trust_store=trust_store, host=args.bind, port=args.port,
-        ticket_key=ticket_key,
+        ticket_key=ticket_key, trusted_transport=args.trusted_transport,
     )
     server.on_connect(handle)
 
@@ -219,15 +231,18 @@ async def cmd_bench(args):
     trust_store = PeerTrustStore(os.path.join(_HERE, ".bench_client_trust.json"))
 
     print(f"Bastion Bench -- connecting to {args.host}:{args.port}")
-    print(f"Client agent_id={args.agent_id!r}, target agent_id={args.target_agent_id!r}\n")
+    print(f"Client agent_id={args.agent_id!r}, target agent_id={args.target_agent_id!r}")
+    print(f"trusted_transport={args.trusted_transport} "
+          f"({'DATA frames unencrypted -- transport-trust mode' if args.trusted_transport else 'DATA frames NaCl-encrypted (default)'})\n")
 
     report: Dict[str, Any] = {
         "target": f"{args.host}:{args.port}",
+        "trusted_transport": args.trusted_transport,
         "started_at": time.time(),
     }
 
     # --- Phase 1: fresh handshake latency (N repetitions) ---
-    print(f"[1/4] Fresh DIRECT-mode handshakes x{args.handshakes} ...")
+    print(f"[1/6] Fresh DIRECT-mode handshakes x{args.handshakes} ...")
     fresh_latencies = []
     last_ticket = None
     last_secret = None
@@ -235,7 +250,7 @@ async def cmd_bench(args):
         t0 = time.perf_counter()
         conn, ticket, secret = await DirectAgentSocket.connect(
             args.host, agent_id=args.agent_id, public_key=pub, signing_key=priv,
-            trust_store=trust_store, port=args.port,
+            trust_store=trust_store, port=args.port, trusted_transport=args.trusted_transport,
         )
         elapsed_ms = (time.perf_counter() - t0) * 1000
         fresh_latencies.append(elapsed_ms)
@@ -248,12 +263,12 @@ async def cmd_bench(args):
     # --- Phase 2: resumed handshake latency (N repetitions, chained tickets) ---
     resumed_latencies = []
     if last_ticket is not None:
-        print(f"[2/4] Resumed handshakes x{args.handshakes} ...")
+        print(f"[2/6] Resumed handshakes x{args.handshakes} ...")
         for i in range(args.handshakes):
             t0 = time.perf_counter()
             conn, next_ticket, secret2 = await DirectAgentSocket.connect(
                 args.host, agent_id=args.agent_id, public_key=pub, signing_key=priv,
-                trust_store=trust_store, port=args.port,
+                trust_store=trust_store, port=args.port, trusted_transport=args.trusted_transport,
                 resume_ticket=last_ticket, resumption_secret=last_secret,
             )
             elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -269,14 +284,14 @@ async def cmd_bench(args):
             report["measured_resumption_speedup_x"] = round(speedup, 2)
             print(f"      measured speedup: {speedup:.2f}x (fresh avg / resumed avg)")
     else:
-        print("[2/4] Skipped -- server did not offer a resumption ticket")
+        print("[2/6] Skipped -- server did not offer a resumption ticket")
         report["resumed_handshake_ms"] = None
 
     # --- Phase 3: throughput over an established connection ---
-    print(f"[3/4] Throughput: {args.messages} messages x {args.size} bytes ...")
+    print(f"[3/6] Throughput: {args.messages} messages x {args.size} bytes ...")
     conn, _t, _s = await DirectAgentSocket.connect(
         args.host, agent_id=args.agent_id, public_key=pub, signing_key=priv,
-        trust_store=trust_store, port=args.port,
+        trust_store=trust_store, port=args.port, trusted_transport=args.trusted_transport,
     )
     payload_blob = os.urandom(args.size).hex()
     rtts = []
@@ -305,7 +320,7 @@ async def cmd_bench(args):
           f"round-trip {report['bastion_throughput']['round_trip_ms']}")
 
     # --- Phase 4: honest baseline -- plain JSON-over-TCP, same transport pattern ---
-    print(f"[4/4] Baseline: plain JSON-over-TCP x{args.messages} (same payload, no crypto) ...")
+    print(f"[4/6] Baseline: plain JSON-over-TCP x{args.messages} (same payload, no crypto) ...")
     baseline = await _run_json_baseline(args, payload_blob, log)
     report["json_baseline_throughput"] = baseline
     print(f"      {baseline['messages_per_sec']} msg/s, {baseline['mb_per_sec']} MB/s, "
@@ -314,6 +329,27 @@ async def cmd_bench(args):
         rt_speedup = baseline["round_trip_ms"]["avg"] / max(report["bastion_throughput"]["round_trip_ms"]["avg"], 0.001)
         report["measured_data_speedup_x"] = round(rt_speedup, 2)
         print(f"      measured Bastion vs plain-JSON round-trip speedup: {rt_speedup:.2f}x")
+
+    # --- Phase 5: pipelined bulk throughput -- fire N sends without waiting
+    # for each response, then drain. This is the number that matters for a
+    # bulk transfer (e.g. "send 200k messages"), not round-trip latency --
+    # a real transfer pipelines instead of waiting for an ack per message.
+    print(f"[5/6] Pipelined bulk send: {args.bulk_messages} messages x {args.size} bytes "
+          f"(fire-and-forget, no per-message ack wait) ...")
+    bulk = await _run_pipelined_bulk_send(args, payload_blob)
+    report["bastion_pipelined_throughput"] = bulk
+    print(f"      {bulk['messages_per_sec']} msg/s, {bulk['mb_per_sec']} MB/s "
+          f"-- {args.bulk_messages} messages in {bulk['total_seconds']}s")
+
+    print(f"[6/6] Baseline: plain JSON-over-TCP pipelined bulk send x{args.bulk_messages} ...")
+    json_bulk = await _run_json_pipelined_baseline(args, payload_blob)
+    report["json_pipelined_throughput"] = json_bulk
+    print(f"      {json_bulk['messages_per_sec']} msg/s, {json_bulk['mb_per_sec']} MB/s "
+          f"-- {args.bulk_messages} messages in {json_bulk['total_seconds']}s")
+    if json_bulk["messages_per_sec"] > 0:
+        pipe_speedup = bulk["messages_per_sec"] / max(json_bulk["messages_per_sec"], 0.001)
+        report["measured_pipelined_speedup_x"] = round(pipe_speedup, 2)
+        print(f"      measured Bastion vs plain-JSON pipelined speedup: {pipe_speedup:.2f}x")
 
     report["resources"] = monitor.stop()
     report["completed_at"] = time.time()
@@ -381,6 +417,83 @@ async def _run_json_baseline(args, payload_blob: str, log: EventLog) -> Dict[str
         }
 
 
+async def _run_pipelined_bulk_send(args, payload_blob: str) -> Dict[str, Any]:
+    """
+    Measures pure send-side throughput: fire N messages back-to-back without
+    waiting for a response after each one, matching how an actual bulk
+    transfer works (not the round-trip-per-message pattern the throughput
+    phase above measures). Opens its own connection so it doesn't disturb
+    sequence state used elsewhere.
+    """
+    from lastbastion.crypto import load_or_create_keypair
+    from lastbastion.protocol.trust_store import PeerTrustStore
+    from lastbastion.protocol.socket import DirectAgentSocket
+
+    pub, priv = load_or_create_keypair(os.path.join(_HERE, ".bench_client.keys.json"))
+    trust_store = PeerTrustStore(os.path.join(_HERE, ".bench_client_trust.json"))
+
+    conn, _t, _s = await DirectAgentSocket.connect(
+        args.host, agent_id=args.agent_id, public_key=pub, signing_key=priv,
+        trust_store=trust_store, port=args.port, trusted_transport=args.trusted_transport,
+    )
+
+    t_start = time.perf_counter()
+    for _ in range(args.bulk_messages):
+        await conn.send({"bulk": True, "data": payload_blob})
+    total_s = time.perf_counter() - t_start
+    await conn.close()
+
+    total_bytes = args.bulk_messages * args.size
+    return {
+        "messages": args.bulk_messages,
+        "total_seconds": round(total_s, 4),
+        "messages_per_sec": round(args.bulk_messages / total_s, 1),
+        "mb_per_sec": round((total_bytes / (1024 * 1024)) / total_s, 3),
+    }
+
+
+async def _run_json_pipelined_baseline(args, payload_blob: str) -> Dict[str, Any]:
+    """
+    Pipelined (fire-and-forget) JSON-over-TCP baseline -- mirrors
+    _run_pipelined_bulk_send but with plain length-prefixed JSON, no crypto.
+    The server side deliberately does not echo (see _run_pipelined_bulk_send's
+    docstring for why: echoing into a client that never drains would deadlock
+    once payload volume exceeds OS socket buffer size). Own port, own
+    ephemeral server, isolated from every other phase.
+    """
+    port = args.port + 2000
+
+    async def handle(reader, writer):
+        try:
+            while True:
+                length_bytes = await reader.readexactly(4)
+                length = int.from_bytes(length_bytes, "big")
+                await reader.readexactly(length)  # drain, no echo -- see docstring
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+
+    server = await asyncio.start_server(handle, args.host if args.host != "localhost" else "0.0.0.0", port)
+    async with server:
+        reader, writer = await asyncio.open_connection(args.host, port)
+        msg = json.dumps({"bulk": True, "data": payload_blob}).encode()
+        framed = len(msg).to_bytes(4, "big") + msg
+
+        t_start = time.perf_counter()
+        for _ in range(args.bulk_messages):
+            writer.write(framed)
+            await writer.drain()
+        total_s = time.perf_counter() - t_start
+        writer.close()
+
+        total_bytes = args.bulk_messages * args.size
+        return {
+            "messages": args.bulk_messages,
+            "total_seconds": round(total_s, 4),
+            "messages_per_sec": round(args.bulk_messages / total_s, 1),
+            "mb_per_sec": round((total_bytes / (1024 * 1024)) / total_s, 3),
+        }
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -395,6 +508,12 @@ def main():
     p_serve.add_argument("--bind", default="0.0.0.0")
     p_serve.add_argument("--port", type=int, default=9100)
     p_serve.add_argument("--agent-id", default="bench-server")
+    p_serve.add_argument(
+        "--trusted-transport", dest="trusted_transport", action="store_true",
+        help="Skip NaCl encryption on DATA/PING/PONG/CLOSE frames -- only for a "
+             "transport you control end-to-end (same host / private network segment). "
+             "Must match the bench side's --trusted-transport setting.",
+    )
 
     p_bench = sub.add_parser("bench", help="Run the sending side and measure everything")
     p_bench.add_argument("--host", required=True, help="Server host/IP (use the serve side's reachable address)")
@@ -402,9 +521,16 @@ def main():
     p_bench.add_argument("--agent-id", default="bench-client")
     p_bench.add_argument("--target-agent-id", default="bench-server")
     p_bench.add_argument("--handshakes", type=int, default=20, help="Repetitions for handshake latency stats")
-    p_bench.add_argument("--messages", type=int, default=200, help="Messages for throughput test")
+    p_bench.add_argument("--messages", type=int, default=200, help="Messages for round-trip throughput test")
+    p_bench.add_argument("--bulk-messages", type=int, default=20000, help="Messages for pipelined bulk-send test")
     p_bench.add_argument("--size", type=int, default=1024, help="Payload size in bytes per message")
     p_bench.add_argument("--report", default="bastion_bench_report.json")
+    p_bench.add_argument(
+        "--trusted-transport", dest="trusted_transport", action="store_true",
+        help="Skip NaCl encryption on DATA/PING/PONG/CLOSE frames -- only for a "
+             "transport you control end-to-end (same host / private network segment). "
+             "Must match the serve side's --trusted-transport setting.",
+    )
 
     args = parser.parse_args()
 

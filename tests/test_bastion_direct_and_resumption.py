@@ -418,3 +418,37 @@ def test_socket_bad_ticket_falls_back_to_fresh_handshake():
             await server.stop()
 
     asyncio.run(run())
+
+
+def test_agent_network_bastion_overlay_uses_direct_trusted_transport():
+    """
+    core/agent_simulator.py's AgentNetwork is the real production path (booted
+    by regional_core.py's startup_event) -- this proves it actually boots 4
+    real DirectAgentSocket servers and successfully trades a real message
+    between two of them, end-to-end, on the DIRECT mode + trusted_transport
+    path (no issuer/passport, no per-message encryption -- see the field
+    comments in AgentNetwork.__init__ for why that's the correct choice for
+    agents inside one ecosystem).
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from core.agent_simulator import AgentNetwork
+
+    async def run():
+        net = AgentNetwork()
+        try:
+            ok = await net._boot_bastion_servers()
+            assert ok is True
+            assert net._bastion_ready is True
+            assert set(net._bastion_servers.keys()) == {"producer", "compliance", "logistics", "buyer"}
+
+            response = await net._send_bastion_message("producer", "compliance", {
+                "batch_id": "TEST-0001", "product": "kiwifruit", "quantity_kg": 1200,
+            })
+            assert response is not None
+            assert response["status"] == "verified"
+            assert response["received"]["batch_id"] == "TEST-0001"
+        finally:
+            for server in net._bastion_servers.values():
+                await server.stop()
+
+    asyncio.run(run())

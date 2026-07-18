@@ -346,11 +346,18 @@ class AgentNetwork:
         self.running = False
         self._cycle = 0
 
-        # Bastion Protocol overlay
-        self._bastion_servers: Dict[str, any] = {}  # name -> AgentSocketServer
-        self._bastion_keys: Dict[str, tuple] = {}   # name -> (signing_key, verify_key)
-        self._bastion_passports: Dict[str, any] = {}  # name -> AgentPassport
-        self._issuer_keys: Optional[tuple] = None    # (public, private) for issuing passports
+        # Bastion Protocol overlay -- DIRECT mode, trusted_transport=True.
+        # These 4 agents are spawned by this same process (or a Pi this
+        # operator controls, when BASTION_HOST points remote) -- one
+        # ecosystem, not crossing into an unfamiliar one. DIRECT mode needs
+        # no issuer/passport office; each agent authenticates with its own
+        # persistent key, verified via X25519 ECDH + TOFU pinning at
+        # handshake time. trusted_transport=True skips the post-handshake
+        # NaCl encryption, which defends against a hostile network between
+        # two points -- there isn't one inside this ecosystem.
+        self._bastion_servers: Dict[str, any] = {}  # name -> DirectAgentSocketServer
+        self._bastion_keys: Dict[str, tuple] = {}   # name -> (public_key, private_key)
+        self._bastion_trust_store = None            # shared PeerTrustStore, set in _boot_bastion_servers
         self._bastion_ready = False
         self._bastion_host = os.environ.get("BASTION_HOST", "localhost")  # Remote agent host
 
@@ -435,9 +442,41 @@ class AgentNetwork:
             except Exception as e:
                 logger.error(f"AGENT NETWORK: failed to start {name}: {e}")
 
-        # Give embedded servers time to bind
-        if any(v is not None for v in self.agent_servers.values()):
-            await asyncio.sleep(2)
+        # Wait for embedded servers to actually bind and accept connections --
+        # a fixed sleep here raced ahead of uvicorn under cold-start load
+        # (4 servers starting concurrently on the same event loop as the
+        # main API process), so discovery in the next phase would find
+        # nothing yet, agent_cards stayed empty, and the continuous loop
+        # later crashed with "Cannot choose from an empty sequence". Poll
+        # each port directly instead of guessing a fixed delay.
+        embedded_ports = [
+            AGENT_PORTS[name] for name, v in self.agent_servers.items() if v is not None
+        ]
+        if embedded_ports:
+            # Measured: cold-starting 4 concurrent uvicorn servers (each
+            # importing the a2a-sdk stack for the first time in this
+            # process) took ~12-14s in a fresh container. A raw TCP connect
+            # check is a false-positive readiness signal here -- the OS
+            # accept queue is live well before uvicorn's ASGI app has
+            # actually finished startup, so discovery's real HTTP GET kept
+            # failing moments after this poll reported "ready". Polling the
+            # actual agent-card endpoint (what discovery uses) is the only
+            # check that means what it claims to mean.
+            deadline = asyncio.get_event_loop().time() + 30.0
+            pending = set(embedded_ports)
+            async with httpx.AsyncClient(timeout=0.5) as probe:
+                while pending and asyncio.get_event_loop().time() < deadline:
+                    for port in list(pending):
+                        try:
+                            resp = await probe.get(f"http://127.0.0.1:{port}/.well-known/agent-card.json")
+                            if resp.status_code == 200:
+                                pending.discard(port)
+                        except Exception:
+                            pass
+                    if pending:
+                        await asyncio.sleep(0.3)
+            if pending:
+                logger.warning(f"AGENT NETWORK: agent cards not ready after 30s: {sorted(pending)}")
 
         return len(self.agent_servers) > 0
 
@@ -481,7 +520,7 @@ class AgentNetwork:
                         f"Agent Card discovered at {url}/.well-known/agent-card.json",
                     )
             except Exception as e:
-                logger.warning(f"AGENT NETWORK: discovery failed for {name}: {e}")
+                logger.warning(f"AGENT NETWORK: discovery failed for {name} at {url}: {type(e).__name__}: {e!r}")
 
             await asyncio.sleep(0.3)
 
@@ -497,7 +536,14 @@ class AgentNetwork:
             swarm_cfg = REGISTRY_BASE_AGENTS.get(name, {})
             m2m_id = swarm_cfg.get("m2m_id", name)
 
-            # M2M protocol registration
+            # M2M protocol registration -- two-step challenge-response
+            # (POST /m2m/register now returns a nonce to sign, not an API
+            # key directly; the old one-step call here always got back
+            # {"status": "PENDING", ...} with no "api_key" field, so
+            # self.api_keys silently stayed empty and every subsequent
+            # /refinery/submit call 401'd with "Unknown API key" -- which
+            # the caller then misreported as a verification REJECTED
+            # verdict, since it only checks resp.status_code == 200.
             try:
                 resp = await client.post(f"{self.registry_base_url}/m2m/register", json={
                     "agent_id": m2m_id,
@@ -508,10 +554,38 @@ class AgentNetwork:
                 })
                 if resp.status_code == 200:
                     data = resp.json()
-                    key_id = data.get("api_key", {}).get("key_id", "")
-                    secret = data.get("api_key", {}).get("secret", "")
-                    self.api_keys[name] = (key_id, secret)
-                    logger.info(f"AGENT NETWORK: M2M registered {m2m_id}")
+                    if "challenge_id" in data:
+                        _, priv = _get_agent_keypair(name)
+                        from nacl.signing import SigningKey
+                        signature = SigningKey(bytes.fromhex(priv)).sign(
+                            data["nonce"].encode()
+                        ).signature.hex()
+                        verify_resp = await client.post(
+                            f"{self.registry_base_url}/m2m/register/verify",
+                            json={"challenge_id": data["challenge_id"], "signature": signature},
+                        )
+                        if verify_resp.status_code == 200:
+                            vdata = verify_resp.json()
+                            key_id = vdata.get("api_key", {}).get("key_id", "")
+                            secret = vdata.get("api_key", {}).get("secret", "")
+                            self.api_keys[name] = (key_id, secret)
+                            logger.info(f"AGENT NETWORK: M2M registered {m2m_id} (challenge-verified)")
+                        else:
+                            logger.warning(
+                                f"AGENT NETWORK: M2M register/verify failed for {name}: "
+                                f"{verify_resp.status_code} {verify_resp.text[:200]}"
+                            )
+                    else:
+                        # Legacy one-step response (REQUIRE_CHALLENGE=false)
+                        key_id = data.get("api_key", {}).get("key_id", "")
+                        secret = data.get("api_key", {}).get("secret", "")
+                        self.api_keys[name] = (key_id, secret)
+                        logger.info(f"AGENT NETWORK: M2M registered {m2m_id}")
+                else:
+                    logger.warning(
+                        f"AGENT NETWORK: M2M register failed for {name}: "
+                        f"{resp.status_code} {resp.text[:200]}"
+                    )
             except Exception as e:
                 logger.warning(f"AGENT NETWORK: M2M register failed for {name}: {e}")
 
@@ -1102,11 +1176,12 @@ class AgentNetwork:
     # ───────────────────────────────────────────────────────────
 
     async def _boot_bastion_servers(self):
-        """Start Bastion Protocol TCP servers for each agent."""
+        """Start Bastion Protocol TCP servers for each agent (DIRECT mode,
+        trusted transport -- see the field comments on __init__)."""
         try:
-            from lastbastion.crypto import load_or_create_issuer_keypair
-            from lastbastion.passport import AgentPassport
-            from lastbastion.protocol import AgentSocket, FrameType
+            from lastbastion.protocol.socket import DirectAgentSocket
+            from lastbastion.protocol.trust_store import PeerTrustStore
+            from lastbastion.protocol.frames import FrameType
             from core.bastion_bus import bastion_bus
         except ImportError as e:
             logger.warning(f"BASTION: cannot import protocol SDK: {e}")
@@ -1115,30 +1190,17 @@ class AgentNetwork:
         is_remote = self._bastion_host != "localhost"
         logger.info(f"BASTION: booting binary protocol {'(remote: ' + self._bastion_host + ')' if is_remote else 'servers'}...")
 
-        # Issuer keypair — env vars first, then the shared local file. Uses the
-        # same resolution as border_agent.py and agent_runner_bastion.py so all
-        # three agree on one issuer identity across processes and restarts.
-        keys_file = os.path.join(os.path.dirname(__file__), "..", ".bastion_keys.json")
-        issuer_pub, issuer_priv = load_or_create_issuer_keypair(keys_file)
-        self._issuer_keys = (issuer_pub, issuer_priv)
+        trust_store_path = os.path.join(_PROJECT_ROOT, ".agent_keys", "ecosystem_trust_store.json")
+        self._bastion_trust_store = PeerTrustStore(trust_store_path)
 
-        # If remote, don't start local servers — just set up passports and keys
+        # If remote, don't start local servers — just set up keys. The Pi (or
+        # wherever BASTION_HOST points) runs its own DirectAgentSocket.listen
+        # instances with the same agent identities and trust store lineage.
         if is_remote:
             logger.info(f"BASTION: remote mode — agents at {self._bastion_host}:9101-9104")
             for name in BASTION_PORTS:
-                self._bastion_keys[name] = (issuer_priv, issuer_pub)
-                passport = AgentPassport(
-                    agent_id=REGISTRY_BASE_AGENTS[name]["m2m_id"],
-                    agent_name=name.title() + "Bot",
-                    public_key=_get_agent_public_key(name),
-                    trust_score=0.92,
-                    trust_level="VERIFIED",
-                    verdict="TRUSTED",
-                    company_name="The Last Bastion",
-                    issuer="the-last-bastion",
-                    issuer_public_key=issuer_pub,
-                ).seal()
-                self._bastion_passports[name] = passport
+                pub, priv = _get_agent_keypair(name)
+                self._bastion_keys[name] = (pub, priv)
             self._bastion_ready = True
             logger.info(f"BASTION: remote mode ready — {len(BASTION_PORTS)} agents configured")
             return True
@@ -1149,44 +1211,24 @@ class AgentNetwork:
             "logistics": "LogisticsBot",
             "buyer": "BuyerBot",
         }
-        agent_roles = {
-            "producer": "DATA_PROVIDER",
-            "compliance": "VERIFIER",
-            "logistics": "DATA_PROVIDER",
-            "buyer": "DATA_CONSUMER",
-        }
 
         for name, port in BASTION_PORTS.items():
             try:
-                # Each agent has its OWN persistent public key as its identity.
-                # `signing_key` still has to be the issuer's private key because
-                # the SDK's build_hello()/build_hello_ack() re-signs the passport
-                # envelope on every handshake using whatever key is passed in —
-                # there's no "present an already issuer-signed passport" path yet.
-                # That means every agent here holds a copy of the issuer's
-                # private key, which is fine for a trusted demo swarm but is NOT
-                # how a real multi-tenant deployment should work (see follow-up:
-                # passports should be issued once, server-side, and presented
-                # pre-signed rather than re-signed by whoever's connecting).
-                pub = _get_agent_public_key(name)
-                priv = issuer_priv
-                self._bastion_keys[name] = (priv, pub)
+                # Each agent authenticates with its OWN persistent Ed25519
+                # identity now -- DIRECT mode doesn't need an issuer/passport
+                # at all, so there's no more reason for every agent to share
+                # the issuer's private key (the old PASSPORT-mode setup did,
+                # only because the SDK re-signs the passport envelope with
+                # whatever key is handed to it -- not a concern here).
+                pub, priv = _get_agent_keypair(name)
+                self._bastion_keys[name] = (pub, priv)
 
-                passport = AgentPassport(
-                    agent_id=REGISTRY_BASE_AGENTS[name]["m2m_id"],
-                    agent_name=agent_names[name],
-                    public_key=pub,
-                    trust_score=0.85 + random.uniform(0, 0.14),
-                    trust_level="VERIFIED",
-                    verdict="TRUSTED",
-                    company_name="The Last Bastion",
-                    issuer="the-last-bastion",
-                    issuer_public_key=issuer_pub,
-                ).seal()
-
-                self._bastion_passports[name] = passport
-
-                # Frame event hooks -> bastion_bus
+                # Frame event hooks -> bastion_bus. trusted_transport=True
+                # means no per-frame signature and no NaCl encryption --
+                # identity was proven once at handshake (X25519 ECDH + TOFU
+                # key pinning), not re-checked per frame, so both fields are
+                # honestly False here rather than the PASSPORT-mode-era
+                # hardcoded True.
                 def make_hooks(agent_name):
                     def on_sent(frame):
                         try:
@@ -1198,9 +1240,9 @@ class AgentNetwork:
                                 direction="SENT",
                                 sequence=frame.sequence if hasattr(frame, 'sequence') else 0,
                                 passport_hash=frame.passport_hash.hex() if hasattr(frame, 'passport_hash') and isinstance(frame.passport_hash, bytes) else "",
-                                signature_verified=True,
-                                encrypted=frame.msg_type not in (0x01, 0x02, 0x0A) if hasattr(frame, 'msg_type') else False,
-                                payload_size=frame.payload_length if hasattr(frame, 'payload_length') else 0,
+                                signature_verified=False,
+                                encrypted=False,
+                                payload_size=len(frame.payload) if hasattr(frame, 'payload') else 0,
                                 total_frame_size=len(frame.to_bytes()) if hasattr(frame, 'to_bytes') else 0,
                             )
                         except Exception:
@@ -1216,9 +1258,9 @@ class AgentNetwork:
                                 direction="RECEIVED",
                                 sequence=frame.sequence if hasattr(frame, 'sequence') else 0,
                                 passport_hash=frame.passport_hash.hex() if hasattr(frame, 'passport_hash') and isinstance(frame.passport_hash, bytes) else "",
-                                signature_verified=True,
-                                encrypted=frame.msg_type not in (0x01, 0x02, 0x0A) if hasattr(frame, 'msg_type') else False,
-                                payload_size=frame.payload_length if hasattr(frame, 'payload_length') else 0,
+                                signature_verified=False,
+                                encrypted=False,
+                                payload_size=len(frame.payload) if hasattr(frame, 'payload') else 0,
                                 total_frame_size=len(frame.to_bytes()) if hasattr(frame, 'to_bytes') else 0,
                             )
                         except Exception:
@@ -1245,12 +1287,14 @@ class AgentNetwork:
                     return handle
 
                 handler = await make_handler(name)
-                server = AgentSocket.listen(
-                    passport=passport,
+                server = DirectAgentSocket.listen(
+                    agent_id=REGISTRY_BASE_AGENTS[name]["m2m_id"],
+                    public_key=pub,
                     signing_key=priv,
-                    verify_key=issuer_pub,
+                    trust_store=self._bastion_trust_store,
                     host="0.0.0.0",
                     port=port,
+                    trusted_transport=True,
                     on_frame_sent=on_sent,
                     on_frame_received=on_recv,
                 )
@@ -1269,19 +1313,19 @@ class AgentNetwork:
     async def _send_bastion_message(
         self, sender: str, target: str, data: dict,
     ) -> Optional[dict]:
-        """Send a message via Bastion Protocol (encrypted binary frame)."""
+        """Send a message via Bastion Protocol, DIRECT mode + trusted transport
+        (see __init__'s field comments for why: same-ecosystem agents, no
+        hostile network between them for encryption to defend against)."""
         if not self._bastion_ready:
             return None
-        if sender not in self._bastion_passports or target not in self._bastion_servers:
+        if sender not in self._bastion_keys or target not in self._bastion_servers:
             return None
 
         try:
-            from lastbastion.protocol import AgentSocket
+            from lastbastion.protocol.socket import DirectAgentSocket
             from core.bastion_bus import bastion_bus
 
-            passport = self._bastion_passports[sender]
-            priv, pub = self._bastion_keys[sender]
-            issuer_pub = self._issuer_keys[0]
+            pub, priv = self._bastion_keys[sender]
             is_remote = self._bastion_host not in ("localhost", "127.0.0.1", "")
             bastion_port_map = REMOTE_BASTION_PORTS if is_remote else BASTION_PORTS
             port = bastion_port_map[target]
@@ -1295,16 +1339,16 @@ class AgentNetwork:
                 sender=sender,
                 receiver=target,
                 session_id=session_id,
-                trust_score=passport.trust_score,
-                passport_hash=passport.crypto_hash[:16] if passport.crypto_hash else "",
             )
 
-            conn = await AgentSocket.connect(
+            conn, _ticket, _secret = await DirectAgentSocket.connect(
                 host=self._bastion_host,
                 port=port,
-                passport=passport,
+                agent_id=REGISTRY_BASE_AGENTS[sender]["m2m_id"],
+                public_key=pub,
                 signing_key=priv,
-                verify_key=issuer_pub,
+                trust_store=self._bastion_trust_store,
+                trusted_transport=True,
             )
 
             latency_hs = (time.monotonic() - t0) * 1000
@@ -1315,8 +1359,6 @@ class AgentNetwork:
                 sender=sender,
                 receiver=target,
                 session_id=session_id,
-                trust_score=conn.peer.trust_score if conn.peer else 0,
-                passport_hash=conn.peer.passport_hash.hex() if conn.peer and isinstance(conn.peer.passport_hash, bytes) else "",
                 latency_ms=latency_hs,
             )
 
@@ -1328,8 +1370,8 @@ class AgentNetwork:
                 sender_agent=sender,
                 receiver_agent=target,
                 direction="SENT",
-                encrypted=True,
-                signature_verified=True,
+                encrypted=False,
+                signature_verified=False,
                 payload_size=len(json.dumps(data)),
                 session_id=session_id,
             )
@@ -1342,8 +1384,8 @@ class AgentNetwork:
                 sender_agent=target,
                 receiver_agent=sender,
                 direction="RECEIVED",
-                encrypted=True,
-                signature_verified=True,
+                encrypted=False,
+                signature_verified=False,
                 payload_size=len(json.dumps(response)) if response else 0,
                 session_id=session_id,
             )
@@ -1360,7 +1402,7 @@ class AgentNetwork:
                 latency_ms=(time.monotonic() - t0) * 1000,
             )
 
-            logger.info(f"BASTION: {sender} -> {target} via encrypted binary ({latency_hs:.0f}ms handshake)")
+            logger.info(f"BASTION: {sender} -> {target} via DIRECT trusted transport ({latency_hs:.0f}ms handshake)")
             return response
 
         except Exception as e:
@@ -1919,6 +1961,15 @@ class AgentNetwork:
                     f"-> {v} ({s:.3f}){' [cached]' if cached else ''}"
                 )
                 return result
+            # Non-200 is an HTTP/auth failure, not a verification verdict --
+            # log it distinctly so it's never confused with a real REJECTED
+            # (the caller defaults to "REJECTED" when this returns None,
+            # which previously made a 401 "Unknown API key" indistinguishable
+            # from the pipeline genuinely rejecting the data).
+            logger.warning(
+                f"AGENT NETWORK: refinery submit for {source_agent}/{doc_type} "
+                f"returned HTTP {resp.status_code} (not a verdict): {resp.text[:200]}"
+            )
         except Exception as e:
             logger.warning(f"AGENT NETWORK: refinery submit failed: {e}")
         return None

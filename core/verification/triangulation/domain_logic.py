@@ -224,6 +224,15 @@ class DomainLogicTriangulator(BaseTriangulator):
                 confidence=min(0.9, 0.5 + ratio * 0.1),
             )
 
+    # Fields whose value is EXPECTED to be in the future (expiry, deadlines,
+    # scheduled events) -- flagging these as "in the future" would penalize
+    # completely legitimate data. Anything else matching date_keywords is
+    # treated as a historical/event date that should be in the past.
+    _FUTURE_DATE_KEYWORDS = [
+        "expir", "expires", "due", "deadline", "valid_until", "valid_to",
+        "renewal", "scheduled", "eta", "delivery_date", "departure",
+    ]
+
     def _check_date_validity(self, claim: DataClaim) -> Optional[Evidence]:
         """Checks if a date value is physically possible."""
         if claim.value is None:
@@ -234,6 +243,8 @@ class DomainLogicTriangulator(BaseTriangulator):
         date_keywords = ["date", "time", "created", "modified", "expires", "born"]
         if not any(kw in field_lower for kw in date_keywords):
             return None
+
+        expects_future = any(kw in field_lower for kw in self._FUTURE_DATE_KEYWORDS)
 
         value_str = str(claim.value)
 
@@ -253,7 +264,9 @@ class DomainLogicTriangulator(BaseTriangulator):
                     confidence=0.6,
                 )
 
-            if parsed > datetime.utcnow():
+            is_future = parsed > datetime.utcnow()
+
+            if is_future and not expects_future:
                 return Evidence(
                     source="domain_logic",
                     source_type=EvidenceType.LOGIC,
@@ -264,13 +277,30 @@ class DomainLogicTriangulator(BaseTriangulator):
                     confidence=0.7,
                 )
 
+            if expects_future and not is_future:
+                return Evidence(
+                    source="domain_logic",
+                    source_type=EvidenceType.LOGIC,
+                    claim_field=claim.field_name,
+                    confirms=False,
+                    found_value=value_str,
+                    reasoning=(
+                        f"'{claim.field_name}' looks like an expiry/deadline "
+                        f"field but {value_str} is already in the past"
+                    ),
+                    confidence=0.6,
+                )
+
             return Evidence(
                 source="domain_logic",
                 source_type=EvidenceType.LOGIC,
                 claim_field=claim.field_name,
                 confirms=True,
                 found_value=value_str,
-                reasoning=f"Date {value_str} is valid and in the past",
+                reasoning=(
+                    f"Date {value_str} is valid and "
+                    f"{'in the future, as expected' if expects_future else 'in the past'}"
+                ),
                 confidence=0.5,
             )
 

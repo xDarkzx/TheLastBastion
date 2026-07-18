@@ -2,6 +2,8 @@
 uvicorn>=0.27.0
 pydantic>=2.6.1
 httpx>=0.26.0
-a2a-sdk[http-server]>=0.3.20
+# Pinned below 1.0 -- see requirements.txt for why (a2a-sdk 1.x removed/
+# renamed DataPart from a2a.types, breaking every agent in agents/a2a/*.py)
+a2a-sdk[http-server]>=0.3.20,<1.0.0
 pynacl>=1.5.0
 msgpack>=1.0.0

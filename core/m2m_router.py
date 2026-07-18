@@ -132,7 +132,16 @@ quotation = QuotationEngine()
 # and a permanent AgentRegistry entry — a Sybil/resource-exhaustion path that
 # per-agent_id rate limiting can never catch, since every fake identity
 # starts its own fresh counter. Keyed by client IP, not agent_id.
-_registration_rate_limiter = RateLimiter(default_limit=5)
+#
+# 5/min was measured too strict for this platform's own architecture: the
+# 4-agent demo swarm (core/agent_simulator.py's AgentNetwork) registers from
+# a single shared IP (they all run inside the same container/process), and
+# each agent needs 2 calls (register + register/verify) -- an 8-request
+# burst that legitimately exceeded 5/min and 429'd the 3rd/4th agent,
+# silently breaking the entire demo. 30/min still meaningfully caps a real
+# Sybil script (which needs hundreds of identities to matter) while covering
+# this platform's own largest legitimate registration burst with headroom.
+_registration_rate_limiter = RateLimiter(default_limit=30)
 blockchain_anchor = BlockchainAnchor()  # Reads env vars, gracefully degrades
 verification_pipeline = VerificationPipeline(
     blockchain_anchor=blockchain_anchor,
@@ -230,7 +239,9 @@ _MAX_DASHBOARD_AGENTS = 200
 def recover_dashboard_agents():
     """
     Startup recovery: loads dashboard agents from DB into in-memory cache.
-    Called from regional_core startup (or on module load).
+    Called from regional_core's startup_event, after init_db() has run --
+    calling this at module-import time (the old behavior) always raced
+    ahead of init_db() and failed silently on a fresh database.
     Skips stale localhost entries when BASTION_HOST points to a remote Pi/server.
     """
     try:
@@ -260,12 +271,6 @@ def recover_dashboard_agents():
     except Exception as e:
         logger.warning(f"Dashboard agent recovery failed: {e}")
 
-
-# Run recovery on import (safe — DB may not be ready yet, so failures are non-fatal)
-try:
-    recover_dashboard_agents()
-except Exception:
-    pass
 
 
 async def recover_orphaned_tasks():

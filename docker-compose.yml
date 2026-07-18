@@ -15,7 +15,7 @@ services:
       retries: 3
 
   db:
-    image: postgres:alpine
+    image: postgres:16-alpine
     environment:
       - POSTGRES_USER=industrial_admin
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-swarm_secret_2026}
@@ -59,7 +59,7 @@ services:
       GROQ_API_KEY: ${GROQ_API_KEY}
       PYTHONPATH: /app
       PYTHONUNBUFFERED: "1"
-      BASTION_HOST: ${BASTION_HOST:-192.168.87.39}
+      BASTION_HOST: ${BASTION_HOST:-localhost}
     extra_hosts:
       - "host.docker.internal:host-gateway"
 

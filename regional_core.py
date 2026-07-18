@@ -1,3 +1,15 @@
+import logging
+# Must run before any other project module is imported -- logging.basicConfig()
+# only takes effect on its FIRST call, and every logger.info(...) call across
+# this codebase (core/agent_simulator.py, core/m2m_router.py, etc.) has been
+# silently dropped this whole time because nothing ever configured the root
+# logger, so Python's default (WARNING) applied everywhere. Only uvicorn's own
+# loggers were ever visible, because uvicorn configures those separately.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
 import os
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy import text
@@ -390,6 +402,19 @@ async def startup_event():
         print("STARTUP: Dashboard agents recovered from DB")
     except Exception as e:
         print(f"STARTUP: Dashboard agent recovery skipped: {e}")
+    # Reload persisted service listings -- the AgentRegistry singleton in
+    # m2m_router.py is constructed at module-import time, which always races
+    # ahead of init_db() above. On a genuinely fresh database (first-ever
+    # boot against an empty volume), that constructor's DB read fails
+    # silently and nothing loads for the rest of this process's lifetime --
+    # calling it again here, after init_db() has actually run, fixes that.
+    # Safe to call twice: it skips any service_id already in memory.
+    try:
+        from core.m2m_router import registry as _m2m_registry
+        _m2m_registry._load_persisted_services()
+        print("STARTUP: Persisted service listings reloaded")
+    except Exception as e:
+        print(f"STARTUP: Service listing reload skipped: {e}")
     # Recover orphaned M2M tasks (queued/running from before restart)
     try:
         from core.m2m_router import recover_orphaned_tasks
