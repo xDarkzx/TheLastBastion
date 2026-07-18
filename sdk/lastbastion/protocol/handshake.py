@@ -16,8 +16,9 @@ Hard dependencies: pynacl (X25519 DH + SecretBox encryption), msgpack.
 import os
 import time
 import hashlib
+import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple, Set
 
 from lastbastion.protocol.frames import (
@@ -31,6 +32,7 @@ from lastbastion.protocol.frames import (
     compute_passport_hash,
 )
 from lastbastion.passport import AgentPassport
+from lastbastion.crypto import verify_signature_raw
 
 # Hard dependency -- no fallback DH or encryption
 try:
@@ -56,21 +58,50 @@ NONCE_CACHE_MAX = 10_000
 # ---------------------------------------------------------------------------
 
 class NonceRegistry:
-    """Thread-safe seen-nonce tracker. Rejects duplicate nonces within the
-    freshness window to prevent replay attacks across different responders.
+    """Seen-nonce tracker. Rejects duplicate nonces within the freshness
+    window to prevent replay attacks across different responders.
+
+    Backed by Redis when available (SET NX EX — atomic, shared across every
+    process/replica), falling back to an in-memory dict otherwise. The
+    in-memory-only fallback is NOT safe once you run more than one Border
+    Police / AgentSocket process: a nonce seen by process A is invisible to
+    process B, so replay protection silently stops working across replicas.
 
     Nonces older than HANDSHAKE_FRESHNESS_SECONDS are automatically purged.
     """
 
     def __init__(self, max_size: int = NONCE_CACHE_MAX):
-        self._seen: dict[bytes, float] = {}  # nonce → timestamp
+        self._seen: dict[bytes, float] = {}  # nonce → timestamp (in-memory fallback)
         self._max_size = max_size
         self._lock = threading.Lock()
+        self._redis = None
+        self._redis_prefix = "bastion:handshake_nonce:"
+        self._init_redis()
+
+    def _init_redis(self) -> None:
+        """Try to connect to Redis for cross-process nonce storage."""
+        try:
+            import os
+            import redis
+            host = os.getenv("REDIS_HOST", "localhost")
+            port = int(os.getenv("REDIS_PORT", "6379"))
+            self._redis = redis.Redis(host=host, port=port, db=0, socket_timeout=2)
+            self._redis.ping()
+        except Exception:
+            self._redis = None  # Fall back to in-memory (single-process only)
 
     def check_and_record(self, nonce: bytes) -> bool:
         """Returns True if nonce is fresh (not seen before). Records it.
         Returns False if nonce was already seen (replay attempt).
         Thread-safe via internal lock."""
+        if self._redis:
+            try:
+                key = self._redis_prefix + nonce.hex()
+                was_set = self._redis.set(key, "1", nx=True, ex=HANDSHAKE_FRESHNESS_SECONDS)
+                return bool(was_set)
+            except Exception:
+                pass  # Redis hiccup — fall through to in-memory for this call
+
         with self._lock:
             self._purge_expired()
 
@@ -141,25 +172,36 @@ class SessionKeys:
     """Derived session keys for encrypt/decrypt after handshake."""
     shared_key: bytes  # 32 bytes -- NaCl SecretBox key
     _alive: bool = True
+    _box: object = field(default=None, repr=False, compare=False)
+
+    def _get_box(self) -> SecretBox:
+        # SecretBox is stateless/reusable for many encrypt/decrypt calls with
+        # the same key -- that's its designed usage. Constructing a fresh one
+        # per call (the original implementation) was measured as a real,
+        # avoidable cost on every single DATA frame; caching it here changes
+        # nothing about the crypto itself, only how many times the wrapper
+        # object gets built.
+        if self._box is None:
+            self._box = SecretBox(self.shared_key)
+        return self._box
 
     def encrypt(self, plaintext: bytes) -> bytes:
         """Encrypt payload with session key (NaCl SecretBox: XSalsa20 + Poly1305)."""
         if not self._alive:
             raise RuntimeError("Session keys destroyed")
-        box = SecretBox(self.shared_key)
-        return bytes(box.encrypt(plaintext))
+        return bytes(self._get_box().encrypt(plaintext))
 
     def decrypt(self, ciphertext: bytes) -> bytes:
         """Decrypt payload with session key."""
         if not self._alive:
             raise RuntimeError("Session keys destroyed")
-        box = SecretBox(self.shared_key)
-        return bytes(box.decrypt(ciphertext))
+        return bytes(self._get_box().decrypt(ciphertext))
 
     def destroy(self):
         """Zero out key material."""
         self.shared_key = b"\x00" * 32
         self._alive = False
+        self._box = None
 
 
 # ---------------------------------------------------------------------------
@@ -451,3 +493,476 @@ class HandshakeResponder:
         )
 
         return ack_frame, result
+
+
+# ---------------------------------------------------------------------------
+# DIRECT Mode -- no passport office required
+# ---------------------------------------------------------------------------
+#
+# Two agents holding their own persistent Ed25519 keypairs can authenticate
+# each other directly, with no issuer/trust-authority in the loop. Security
+# comes from key PINNING (see trust_store.PeerTrustStore) -- the same trust
+# model SSH uses for host keys, not the same model as a CA-issued certificate.
+# This exists for exactly the case where no Bastion verification authority
+# exists (yet), but two agents still want a fast, encrypted, mutually
+# authenticated channel.
+#
+# Security note: the responder verifies the frame's Ed25519 signature against
+# whatever public_key the HELLO payload CLAIMS (there's no other way to check
+# it — the key itself is what's being introduced). That is only safe because
+# of what happens next: the claimed (agent_id, public_key) pair is checked
+# against the trust store, which independently decides whether to accept it
+# (already pinned + matches, or first contact under TOFU) or reject it
+# (pinned to a DIFFERENT key = impersonation signal, never silently accepted).
+# Skipping that second, independent check is exactly the bug that was found
+# and fixed in core/border_agent.py's PASSPORT-mode handling.
+#
+# Known limitation, inherent to TOFU (same as SSH host keys): first contact
+# is trust-on-faith. If an attacker wins the race to be the FIRST party to
+# claim a given agent_id (before the real agent ever connects), their key
+# gets pinned instead of the real one, and the real agent is later rejected
+# as the "impersonator." TOFU protects every connection AFTER the first one,
+# not the first one itself. For agents where that first-contact risk isn't
+# acceptable, pre-populate the trust store via PeerTrustStore.pin() using a
+# key learned out-of-band (e.g. from an A2A Agent Card fetched over TLS)
+# instead of relying on tofu=True.
+
+def build_direct_hello(
+    agent_id: str,
+    public_key: str,
+    signing_key: str,
+    ephemeral_pub: bytes,
+) -> BastionFrame:
+    """Build a DIRECT-mode HELLO frame -- no passport, just the sender's own identity."""
+    payload_data = {
+        "mode": "direct",
+        "agent_id": agent_id,
+        "public_key": public_key,
+        "ephemeral_pub": ephemeral_pub,
+        "supported_versions": [PROTOCOL_VERSION],
+        "nonce": os.urandom(32),
+        "timestamp": time.time(),
+    }
+    payload = serialize_payload(payload_data)
+    # passport_hash header field has no passport to hash in DIRECT mode --
+    # filled with a hash of agent_id purely for observability/logging, never
+    # trusted as an identity proof on its own
+    encoder = FrameEncoder(compute_passport_hash(agent_id), signing_key)
+    return encoder.encode(FrameType.HELLO, payload)
+
+
+def build_direct_hello_ack(
+    agent_id: str,
+    public_key: str,
+    signing_key: str,
+    ephemeral_pub: bytes,
+    peer_nonce: bytes,
+    chosen_version: int = PROTOCOL_VERSION,
+    session_ticket: Optional[bytes] = None,
+) -> BastionFrame:
+    """
+    Build a DIRECT-mode HELLO_ACK frame.
+
+    session_ticket is optional -- only present if the responder is configured
+    with a ticket_key (see DirectHandshakeResponder). Lets the client resume
+    this session later without a full handshake.
+    """
+    payload_data = {
+        "mode": "direct",
+        "agent_id": agent_id,
+        "public_key": public_key,
+        "ephemeral_pub": ephemeral_pub,
+        "chosen_version": chosen_version,
+        "nonce": os.urandom(32),
+        "peer_nonce": peer_nonce,
+        "timestamp": time.time(),
+        "session_ticket": session_ticket,
+    }
+    payload = serialize_payload(payload_data)
+    encoder = FrameEncoder(compute_passport_hash(agent_id), signing_key)
+    return encoder.encode(FrameType.HELLO_ACK, payload)
+
+
+def _parse_direct_payload(frame: BastionFrame, expected_type: FrameType) -> dict:
+    """Shared payload parsing for DIRECT-mode HELLO/HELLO_ACK (structure + freshness only)."""
+    if frame.msg_type != expected_type:
+        raise ValueError(f"Expected 0x{expected_type:02x}, got 0x{frame.msg_type:02x}")
+    data = deserialize_payload(frame.payload)
+    if data.get("mode") != "direct":
+        raise ValueError("Not a DIRECT-mode frame")
+
+    timestamp = data.get("timestamp", 0)
+    age = abs(time.time() - timestamp)
+    if age > HANDSHAKE_FRESHNESS_SECONDS:
+        raise ValueError(f"DIRECT-mode frame too old: {age:.1f}s (max {HANDSHAKE_FRESHNESS_SECONDS}s)")
+
+    for key in ("ephemeral_pub", "nonce", "peer_nonce"):
+        if isinstance(data.get(key), list):
+            data[key] = bytes(data[key])
+    return data
+
+
+@dataclass
+class DirectHandshakeResult:
+    """Result of a successful DIRECT-mode handshake."""
+    session_keys: SessionKeys
+    peer_agent_id: str
+    peer_public_key: str
+    chosen_version: int
+    ephemeral_keypair: EphemeralKeyPair
+    trust_pin: object  # trust_store.PinResult — tells the caller if this was first contact (TOFU)
+    resumption_secret: bytes = b""  # Derived from session_keys.shared_key -- store alongside session_ticket
+    session_ticket: Optional[bytes] = None  # None if the peer didn't offer resumption
+
+    def finalize(self):
+        """Destroy ephemeral keys after session setup is complete."""
+        self.ephemeral_keypair.destroy()
+
+
+class DirectHandshakeInitiator:
+    """Client-side DIRECT-mode handshake: send HELLO, receive HELLO_ACK, derive session key."""
+
+    def __init__(self, agent_id: str, public_key: str, signing_key: str, trust_store):
+        """
+        Args:
+            agent_id: This agent's identifier
+            public_key: This agent's own Ed25519 public key (hex)
+            signing_key: This agent's own Ed25519 private key (hex) — signs the HELLO
+            trust_store: A trust_store.PeerTrustStore used to pin/verify the peer's key
+        """
+        self.agent_id = agent_id
+        self.public_key = public_key
+        self.signing_key = signing_key
+        self.trust_store = trust_store
+        self.ephemeral = generate_ephemeral_keypair()
+        self._hello_nonce: bytes = b""
+
+    def build_hello(self) -> BastionFrame:
+        """Build the HELLO frame to send."""
+        frame = build_direct_hello(self.agent_id, self.public_key, self.signing_key, self.ephemeral.public_key)
+        data = deserialize_payload(frame.payload)
+        nonce = data["nonce"]
+        self._hello_nonce = nonce if isinstance(nonce, bytes) else bytes(nonce)
+        return frame
+
+    def complete(self, hello_ack_frame: BastionFrame, tofu: bool = True) -> DirectHandshakeResult:
+        """Process HELLO_ACK, verify + pin the peer's key, and derive session keys."""
+        raw_data = deserialize_payload(hello_ack_frame.payload)
+        claimed_pub = raw_data.get("public_key", "")
+        if not claimed_pub:
+            raise ValueError("DIRECT-mode HELLO_ACK missing public_key")
+
+        # Verify the frame was really signed by whoever holds the private key
+        # matching the claimed public key. Safe ONLY because trust_store below
+        # independently decides whether that claimed key is the right one.
+        if not verify_signature_raw(
+            hello_ack_frame.signable_bytes, hello_ack_frame.signature, claimed_pub
+        ):
+            raise ValueError("DIRECT-mode HELLO_ACK signature verification failed")
+
+        ack_data = _parse_direct_payload(hello_ack_frame, FrameType.HELLO_ACK)
+        if ack_data.get("peer_nonce") != self._hello_nonce:
+            raise ValueError("HELLO_ACK nonce mismatch -- possible replay")
+
+        peer_agent_id = ack_data["agent_id"]
+        pin_result = self.trust_store.verify_or_pin(peer_agent_id, claimed_pub, tofu=tofu)
+        if not pin_result.accepted:
+            raise ValueError(
+                f"DIRECT-mode trust check failed for {peer_agent_id}: {pin_result.reason}"
+            )
+
+        peer_ephemeral = ack_data["ephemeral_pub"]
+        shared_secret = self.ephemeral.derive_shared_key(peer_ephemeral)
+        session_keys = SessionKeys(shared_key=shared_secret)
+
+        from lastbastion.protocol.resumption import derive_resumption_secret
+        resumption_secret = derive_resumption_secret(shared_secret)
+
+        session_ticket = ack_data.get("session_ticket")
+        if isinstance(session_ticket, list):
+            session_ticket = bytes(session_ticket)
+
+        return DirectHandshakeResult(
+            session_keys=session_keys,
+            peer_agent_id=peer_agent_id,
+            peer_public_key=claimed_pub,
+            chosen_version=ack_data.get("chosen_version", PROTOCOL_VERSION),
+            ephemeral_keypair=self.ephemeral,
+            trust_pin=pin_result,
+            resumption_secret=resumption_secret,
+            session_ticket=session_ticket,
+        )
+
+
+class DirectHandshakeResponder:
+    """Server-side DIRECT-mode handshake: receive HELLO, send HELLO_ACK, derive session key."""
+
+    def __init__(
+        self,
+        agent_id: str,
+        public_key: str,
+        signing_key: str,
+        trust_store,
+        nonce_registry: Optional[NonceRegistry] = None,
+        ticket_key: Optional[bytes] = None,
+    ):
+        """
+        Args:
+            agent_id: This agent's identifier
+            public_key: This agent's own Ed25519 public key (hex)
+            signing_key: This agent's own Ed25519 private key (hex) — signs the HELLO_ACK
+            trust_store: A trust_store.PeerTrustStore used to pin/verify the peer's key
+            nonce_registry: Optional NonceRegistry for replay detection (uses global if not provided)
+            ticket_key: Optional symmetric key (crypto.load_or_create_symmetric_key)
+                — when set, every successful handshake also issues a session
+                ticket in the HELLO_ACK so the peer can resume later without a
+                full handshake. Omit to run DIRECT mode without resumption.
+        """
+        self.agent_id = agent_id
+        self.public_key = public_key
+        self.signing_key = signing_key
+        self.trust_store = trust_store
+        self.ephemeral = generate_ephemeral_keypair()
+        self._nonce_registry = nonce_registry or _global_nonce_registry
+        self.ticket_key = ticket_key
+
+    def process_hello(
+        self, hello_frame: BastionFrame, tofu: bool = True
+    ) -> Tuple[BastionFrame, DirectHandshakeResult]:
+        """
+        Process incoming DIRECT-mode HELLO frame. Returns (HELLO_ACK frame, DirectHandshakeResult).
+        Raises ValueError if the peer is rejected or the nonce was replayed.
+        """
+        raw_data = deserialize_payload(hello_frame.payload)
+        claimed_pub = raw_data.get("public_key", "")
+        if not claimed_pub:
+            raise ValueError("DIRECT-mode HELLO missing public_key")
+
+        if not verify_signature_raw(
+            hello_frame.signable_bytes, hello_frame.signature, claimed_pub
+        ):
+            raise ValueError("DIRECT-mode HELLO signature verification failed")
+
+        hello_data = _parse_direct_payload(hello_frame, FrameType.HELLO)
+
+        # Anti-replay: reject duplicate nonces
+        if not self._nonce_registry.check_and_record(hello_data["nonce"]):
+            raise ValueError("HELLO nonce replay detected -- duplicate nonce rejected")
+
+        peer_agent_id = hello_data["agent_id"]
+        pin_result = self.trust_store.verify_or_pin(peer_agent_id, claimed_pub, tofu=tofu)
+        if not pin_result.accepted:
+            raise ValueError(
+                f"DIRECT-mode trust check failed for {peer_agent_id}: {pin_result.reason}"
+            )
+
+        supported = hello_data.get("supported_versions", [PROTOCOL_VERSION])
+        if PROTOCOL_VERSION not in supported:
+            raise ValueError(f"No compatible version (peer supports {supported})")
+
+        peer_ephemeral = hello_data["ephemeral_pub"]
+        shared_secret = self.ephemeral.derive_shared_key(peer_ephemeral)
+        session_keys = SessionKeys(shared_key=shared_secret)
+
+        from lastbastion.protocol.resumption import derive_resumption_secret, issue_ticket
+        resumption_secret = derive_resumption_secret(shared_secret)
+
+        session_ticket = None
+        if self.ticket_key is not None:
+            session_ticket = issue_ticket(
+                self.ticket_key, peer_agent_id, claimed_pub, resumption_secret,
+            )
+
+        ack_frame = build_direct_hello_ack(
+            self.agent_id,
+            self.public_key,
+            self.signing_key,
+            self.ephemeral.public_key,
+            peer_nonce=hello_data["nonce"],
+            session_ticket=session_ticket,
+        )
+
+        result = DirectHandshakeResult(
+            session_keys=session_keys,
+            peer_agent_id=peer_agent_id,
+            peer_public_key=claimed_pub,
+            chosen_version=PROTOCOL_VERSION,
+            ephemeral_keypair=self.ephemeral,
+            trust_pin=pin_result,
+            resumption_secret=resumption_secret,
+            session_ticket=session_ticket,
+        )
+        return ack_frame, result
+
+
+# ---------------------------------------------------------------------------
+# Session Resumption (RESUME / RESUME_ACK)
+# ---------------------------------------------------------------------------
+#
+# Works identically for a session that started in PASSPORT mode or DIRECT
+# mode -- resumption only needs (agent_id, public_key, resumption_secret),
+# not the original passport itself. See resumption.py for the ticket crypto
+# and the reasoning behind it (forward secrecy across resumptions, single-use
+# tickets, rotation).
+
+def build_resume(ticket: bytes, client_nonce: bytes) -> BastionFrame:
+    """Build a RESUME frame -- presents a prior session's ticket instead of a full HELLO."""
+    payload_data = {
+        "ticket": ticket,
+        "client_nonce": client_nonce,
+        "timestamp": time.time(),
+    }
+    payload = serialize_payload(payload_data)
+    # RESUME carries no Ed25519 signature -- the encrypted ticket itself IS
+    # the credential (only the server that issued it can decrypt it)
+    encoder = FrameEncoder(b"\x00" * PASSPORT_HASH_SIZE, "")
+    return encoder.encode(FrameType.RESUME, payload)
+
+
+def parse_resume(frame: BastionFrame) -> dict:
+    """Parse a RESUME frame payload."""
+    if frame.msg_type != FrameType.RESUME:
+        raise ValueError(f"Expected RESUME, got 0x{frame.msg_type:02x}")
+    data = deserialize_payload(frame.payload)
+    for key in ("ticket", "client_nonce"):
+        if isinstance(data.get(key), list):
+            data[key] = bytes(data[key])
+    timestamp = data.get("timestamp", 0)
+    age = abs(time.time() - timestamp)
+    if age > HANDSHAKE_FRESHNESS_SECONDS:
+        raise ValueError(f"RESUME frame too old: {age:.1f}s (max {HANDSHAKE_FRESHNESS_SECONDS}s)")
+    return data
+
+
+@dataclass
+class ResumeResult:
+    """Result of a successful session resumption."""
+    session_keys: SessionKeys
+    peer_agent_id: str
+    peer_public_key: str
+    next_ticket: bytes  # Rotated ticket to store for the FOLLOWING reconnect
+
+
+class ResumptionResponder:
+    """
+    Server-side resumption handler.
+
+    Needs the server's ticket_key (symmetric, generated once via
+    crypto.load_or_create_symmetric_key, never sent over the wire) and a
+    NonceRegistry to enforce single-use redemption.
+    """
+
+    def __init__(
+        self,
+        ticket_key: bytes,
+        nonce_registry: Optional[NonceRegistry] = None,
+        revocation_check=None,
+    ):
+        """
+        Args:
+            ticket_key: This server's symmetric ticket-encryption key
+            nonce_registry: Optional NonceRegistry for single-use enforcement
+                (uses global if not provided — pass a dedicated one to keep
+                ticket IDs and handshake nonces in separate namespaces)
+            revocation_check: Optional callable(agent_id) -> bool, True if
+                agent_id is currently revoked. A resumed session skips full
+                passport/trust re-verification by design, so if you need live
+                revocation to apply to resumed sessions too (not just fresh
+                handshakes), wire it here. Kept as a pluggable callback rather
+                than importing a specific app's DB layer directly, since the
+                SDK itself has no opinion on where revocation state lives.
+        """
+        self.ticket_key = ticket_key
+        self._nonce_registry = nonce_registry or _global_nonce_registry
+        self.revocation_check = revocation_check
+        if revocation_check is None:
+            logging.getLogger("BastionResumption").warning(
+                "ResumptionResponder created with no revocation_check — resumed "
+                "sessions will NOT be checked against live revocation status for "
+                "up to the ticket's TTL. Wire revocation_check if agents can be "
+                "revoked mid-session and that should take effect before the "
+                "ticket naturally expires."
+            )
+
+    def process_resume(self, resume_frame: BastionFrame) -> Tuple[BastionFrame, ResumeResult]:
+        """
+        Process an incoming RESUME frame. Returns (RESUME_ACK frame, ResumeResult).
+        Raises ValueError if the ticket is invalid, expired, already redeemed,
+        or the agent has been revoked.
+        """
+        from lastbastion.protocol.resumption import (
+            redeem_ticket,
+            derive_resumed_session_key,
+            issue_ticket,
+        )
+
+        data = parse_resume(resume_frame)
+        ticket = data["ticket"]
+        client_nonce = data["client_nonce"]
+
+        try:
+            claims = redeem_ticket(self.ticket_key, ticket)
+        except ValueError as e:
+            raise ValueError(f"TICKET_INVALID: {e}")
+
+        # Single-use enforcement -- this exact ticket must never be redeemed twice
+        if not self._nonce_registry.check_and_record(claims.ticket_id):
+            raise ValueError("TICKET_REPLAYED: ticket already redeemed")
+
+        if self.revocation_check is not None and self.revocation_check(claims.agent_id):
+            raise ValueError(f"PEER_REVOKED: {claims.agent_id} has been revoked")
+
+        server_nonce = os.urandom(32)
+        session_key = derive_resumed_session_key(
+            claims.resumption_secret, client_nonce, server_nonce
+        )
+        session_keys = SessionKeys(shared_key=session_key)
+
+        # Rotate: issue a fresh ticket bound to the same resumption_secret for
+        # the NEXT reconnect, so a stolen ticket only ever grants one resumption
+        next_ticket = issue_ticket(
+            self.ticket_key, claims.agent_id, claims.public_key, claims.resumption_secret,
+        )
+
+        ack_payload = serialize_payload({
+            "server_nonce": server_nonce,
+            "next_ticket": next_ticket,
+            "timestamp": time.time(),
+        })
+        encoder = FrameEncoder(b"\x00" * PASSPORT_HASH_SIZE, "")
+        ack_frame = encoder.encode(FrameType.RESUME_ACK, ack_payload)
+
+        result = ResumeResult(
+            session_keys=session_keys,
+            peer_agent_id=claims.agent_id,
+            peer_public_key=claims.public_key,
+            next_ticket=next_ticket,
+        )
+        return ack_frame, result
+
+
+def complete_resume(
+    ack_frame: BastionFrame, client_nonce: bytes, resumption_secret: bytes,
+) -> Tuple[SessionKeys, bytes]:
+    """
+    Client-side: derives the same session key the server derived from a
+    RESUME_ACK, and extracts the next (rotated) ticket to store for the
+    following reconnect.
+
+    Returns (session_keys, next_ticket).
+    """
+    from lastbastion.protocol.resumption import derive_resumed_session_key
+
+    if ack_frame.msg_type != FrameType.RESUME_ACK:
+        raise ValueError(f"Expected RESUME_ACK, got 0x{ack_frame.msg_type:02x}")
+
+    data = deserialize_payload(ack_frame.payload)
+    server_nonce = data["server_nonce"]
+    if isinstance(server_nonce, list):
+        server_nonce = bytes(server_nonce)
+    next_ticket = data["next_ticket"]
+    if isinstance(next_ticket, list):
+        next_ticket = bytes(next_ticket)
+
+    session_key = derive_resumed_session_key(resumption_secret, client_nonce, server_nonce)
+    return SessionKeys(shared_key=session_key), next_ticket

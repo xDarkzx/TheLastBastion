@@ -88,17 +88,35 @@ def build_a2a_server(
     )
 
 
+_shared_http_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    """
+    Shared, connection-pooling HTTP client for outgoing A2A calls.
+
+    Opening a fresh httpx.AsyncClient per call means a fresh TCP+TLS handshake
+    for every single JSON-RPC message — the biggest fixable latency cost on
+    the A2A side. Reusing one client lets httpx keep-alive connections per
+    host across calls instead of reconnecting every time.
+    """
+    global _shared_http_client
+    if _shared_http_client is None or _shared_http_client.is_closed:
+        _shared_http_client = httpx.AsyncClient(timeout=30.0)
+    return _shared_http_client
+
+
 async def discover_agent(agent_url: str) -> Optional[AgentCard]:
     """Fetches another agent's Agent Card for discovery."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            a2a_client = A2AClient(httpx_client=client, url=agent_url)
-            card = await a2a_client.get_card()
-            logger.info(f"Discovered agent: {card.name} at {agent_url}")
-            return card
-        except Exception as e:
-            logger.error(f"Failed to discover agent at {agent_url}: {e}")
-            return None
+    client = _get_http_client()
+    try:
+        a2a_client = A2AClient(httpx_client=client, url=agent_url)
+        card = await a2a_client.get_card()
+        logger.info(f"Discovered agent: {card.name} at {agent_url}")
+        return card
+    except Exception as e:
+        logger.error(f"Failed to discover agent at {agent_url}: {e}")
+        return None
 
 
 async def send_a2a_message(
@@ -112,33 +130,33 @@ async def send_a2a_message(
 
     This is the standard way agents communicate in A2A.
     """
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        a2a_client = A2AClient(httpx_client=client, url=target_url)
+    client = _get_http_client()
+    a2a_client = A2AClient(httpx_client=client, url=target_url)
 
-        message = Message(
-            messageId=str(uuid.uuid4()),
-            role=Role.user,
-            parts=parts,
-            contextId=context_id,
-        )
+    message = Message(
+        messageId=str(uuid.uuid4()),
+        role=Role.user,
+        parts=parts,
+        contextId=context_id,
+    )
 
-        request = SendMessageRequest(
-            id=str(uuid.uuid4()),
-            params=MessageSendParams(
-                message=message,
-                metadata=metadata,
-            ),
-        )
+    request = SendMessageRequest(
+        id=str(uuid.uuid4()),
+        params=MessageSendParams(
+            message=message,
+            metadata=metadata,
+        ),
+    )
 
-        response = await a2a_client.send_message(request)
+    response = await a2a_client.send_message(request)
 
-        # Extract result from response
-        result = response.root
-        if hasattr(result, "result"):
-            return _serialize_response(result.result)
-        elif hasattr(result, "error"):
-            return {"error": str(result.error)}
-        return {"raw": str(result)}
+    # Extract result from response
+    result = response.root
+    if hasattr(result, "result"):
+        return _serialize_response(result.result)
+    elif hasattr(result, "error"):
+        return {"error": str(result.error)}
+    return {"raw": str(result)}
 
 
 def _serialize_response(result) -> dict:

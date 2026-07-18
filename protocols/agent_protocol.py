@@ -1,6 +1,21 @@
 """
 Agent Communication Protocol (ACP) — The Last Bastion M2M Foundation.
 
+DEPRECATED (as of the Bastion Protocol work): the ProtocolMessage/MessageType
+signed-JSON-envelope pieces of this module are superseded by Bastion Protocol
+(sdk/lastbastion/protocol/) — same Ed25519 identity and replay protection,
+but binary (MessagePack, not JSON) and materially faster. Nothing in the live
+/m2m/* HTTP endpoints signs or verifies a ProtocolMessage anymore; that path
+uses plain REST + API keys (see protocols/auth.py's authenticate_api_key).
+ProtocolMessage/sign_message/authenticate_message are kept only because
+scripts/run_backend_test.py (Phase 20) and core/attacks/replay.py still
+exercise them — don't build new features on this envelope; use Bastion
+Protocol instead.
+
+AgentIdentity/AgentRole below are NOT part of that deprecation — they're the
+shared identity model used across AgentRegistry, M2MAuthenticator, and the
+REST API-key auth path, independent of whether ACP's message envelope is used.
+
 Defines the standard message format, identity system, and
 protocol types that ALL machine-to-machine communication uses.
 

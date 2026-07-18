@@ -44,6 +44,12 @@ class HandoffClient:
         self.api_secret = ""
         self._client = httpx.AsyncClient(timeout=API_TIMEOUT)
 
+    def _auth_headers(self) -> Dict[str, str]:
+        """Headers for endpoints that require an API key (set after register_self())."""
+        if not self.api_key_id:
+            return {}
+        return {"x-api-key-id": self.api_key_id, "x-api-secret": self.api_secret}
+
     async def register_self(
         self,
         public_key: str = "",
@@ -52,12 +58,14 @@ class HandoffClient:
         capabilities: list = None,
     ) -> Dict[str, Any]:
         """Registers this agent with The Last Bastion. Returns API key."""
+        if not public_key:
+            return {"error": "public_key is required — refusing to register with a placeholder key"}
         try:
             resp = await self._client.post(
                 f"{self.api_base}/m2m/register",
                 json={
                     "agent_id": self.agent_id,
-                    "public_key": public_key or "0" * 64,
+                    "public_key": public_key,
                     "role": role,
                     "display_name": display_name or self.agent_id,
                     "capabilities": capabilities or [],
@@ -87,6 +95,8 @@ class HandoffClient:
         metadata: dict = None,
     ) -> Dict[str, Any]:
         """Submits this agent for full verification (passport stamping)."""
+        if not public_key:
+            return {"error": "public_key is required — refusing to verify with a placeholder key"}
         try:
             resp = await self._client.post(
                 f"{self.api_base}/m2m/verify-agent",
@@ -94,10 +104,11 @@ class HandoffClient:
                     "agent_id": self.agent_id,
                     "agent_name": agent_name or self.agent_id,
                     "agent_url": agent_url,
-                    "public_key": public_key or "0" * 64,
+                    "public_key": public_key,
                     "capabilities": capabilities or [],
                     "metadata": metadata or {},
                 },
+                headers=self._auth_headers(),
             )
             resp.raise_for_status()
             return resp.json()
@@ -158,6 +169,7 @@ class HandoffClient:
                     "payload": payload,
                     "payload_summary": payload_summary,
                 },
+                headers=self._auth_headers(),
             )
             resp.raise_for_status()
             data = resp.json()

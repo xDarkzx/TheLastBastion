@@ -249,7 +249,6 @@ gateway = LastBastionGateway(
 | `renew_passport(agent_id)` | Re-verify and issue fresh passport |
 | `register_and_verify(agent_id, ...)` | Full flow: register → verify → passport |
 | `start_session(agent_id, config)` | Start sandbox test session |
-| `run_attacks(session_id, attack_types)` | Run attack simulations |
 | `handoff(sender_id, receiver_id, payload)` | Verified agent-to-agent handoff |
 
 ### `LastBastionGateway`

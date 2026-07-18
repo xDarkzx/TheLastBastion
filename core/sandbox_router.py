@@ -5,8 +5,7 @@ Provides multi-tenant sandbox test environment where external developers can:
 1. Register an organization and get sandbox API keys
 2. Start test sessions for their agents
 3. Submit payloads for verification in sandbox context
-4. Run attack simulations (prompt injection, spoofing, Sybil, etc.)
-5. View trust history and leaderboard
+4. View trust history and leaderboard
 """
 
 import logging
@@ -23,15 +22,12 @@ from core.database import (
     get_sandbox_organization,
     save_persistent_api_key,
     save_sandbox_session,
-    update_sandbox_session,
     get_sandbox_session,
     list_sandbox_sessions,
-    save_trust_score_history,
     get_trust_score_history,
     get_sandbox_attack_results,
     get_sandbox_leaderboard,
     get_sandbox_stats,
-    save_sandbox_attack_result,
     get_all_attack_results,
     get_agent_attack_summary,
     get_research_discoveries,
@@ -63,10 +59,6 @@ class SessionSubmitRequest(BaseModel):
     payload: Dict
     context: Dict = Field(default_factory=dict)
     source_agent_id: str = ""
-
-
-class RunAttacksRequest(BaseModel):
-    attack_types: List[str] = Field(default_factory=list)
 
 
 class QuickSessionRequest(BaseModel):
@@ -186,10 +178,6 @@ async def start_sandbox_session(
 
     config = request.config or {}
     config.setdefault("timeout", 3600)
-    config.setdefault("attack_types", [
-        "prompt_injection", "identity_spoofing", "sybil_flood",
-        "data_exfiltration", "payload_poisoning", "replay",
-    ])
 
     session = save_sandbox_session(
         session_id=session_id,
@@ -274,70 +262,6 @@ async def submit_to_session(
             "score": 0.0,
             "error": "Internal verification error",
         }
-
-
-@sandbox_router.post("/sessions/{session_id}/attacks")
-async def run_attack_simulation(
-    session_id: str,
-    request: RunAttacksRequest,
-    x_api_key_id: str = Header("", alias="X-API-Key-ID"),
-    x_api_secret: str = Header("", alias="X-API-Secret"),
-):
-    """Run attack simulations against an agent in a sandbox session."""
-    agent_id, org_id, env = _authenticate_sandbox(x_api_key_id, x_api_secret)
-
-    session = get_sandbox_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    if session["status"] != "active":
-        raise HTTPException(status_code=400, detail=f"Session is {session['status']}")
-
-    # Import and run the attack simulator
-    from core.attack_simulator import AttackSimulator
-
-    simulator = AttackSimulator()
-    attack_types = request.attack_types or session.get("config", {}).get("attack_types", [])
-
-    results = await simulator.run_attacks(
-        session_id=session_id,
-        agent_id=session["agent_id"],
-        attack_types=attack_types,
-    )
-
-    # Record trust score change
-    total = len(results)
-    passed = sum(1 for r in results if r.get("passed", False))
-    resilience_score = passed / total if total > 0 else 0.0
-
-    save_trust_score_history(
-        agent_id=session["agent_id"],
-        previous_score=0.0,  # Will be enriched by verifier
-        new_score=resilience_score,
-        reason=f"Attack simulation: {passed}/{total} passed",
-        event_type="attack_test",
-        session_id=session_id,
-    )
-
-    # Update session with results summary
-    update_sandbox_session(
-        session_id=session_id,
-        results_summary={
-            "total_attacks": total,
-            "passed": passed,
-            "failed": total - passed,
-            "resilience_score": resilience_score,
-            "attack_results": results,
-        },
-    )
-
-    return {
-        "session_id": session_id,
-        "total_attacks": total,
-        "passed": passed,
-        "failed": total - passed,
-        "resilience_score": resilience_score,
-        "results": results,
-    }
 
 
 @sandbox_router.get("/sessions/{session_id}/results")
@@ -482,13 +406,7 @@ async def dashboard_quick_session(request: QuickSessionRequest):
     session_id = f"sess-{uuid.uuid4().hex[:12]}"
     expires_at = datetime.utcnow() + timedelta(hours=1)
 
-    config = {
-        "timeout": 3600,
-        "attack_types": [
-            "prompt_injection", "identity_spoofing", "sybil_flood",
-            "data_exfiltration", "payload_poisoning", "replay",
-        ],
-    }
+    config = {"timeout": 3600}
 
     session = save_sandbox_session(
         session_id=session_id,
@@ -504,60 +422,6 @@ async def dashboard_quick_session(request: QuickSessionRequest):
         "status": "active",
         "config": config,
         "expires_at": expires_at.isoformat(),
-    }
-
-
-@sandbox_router.post("/dashboard/sessions/{session_id}/run-attacks")
-async def dashboard_run_attacks(session_id: str, request: RunAttacksRequest):
-    """Run attacks from the dashboard — no API key needed."""
-    session = get_sandbox_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    if session["status"] != "active":
-        raise HTTPException(status_code=400, detail=f"Session is {session['status']}")
-
-    from core.attack_simulator import AttackSimulator
-
-    simulator = AttackSimulator()
-    attack_types = request.attack_types or session.get("config", {}).get("attack_types", [])
-
-    results = await simulator.run_attacks(
-        session_id=session_id,
-        agent_id=session["agent_id"],
-        attack_types=attack_types,
-    )
-
-    total = len(results)
-    passed = sum(1 for r in results if r.get("passed", False))
-    resilience_score = passed / total if total > 0 else 0.0
-
-    save_trust_score_history(
-        agent_id=session["agent_id"],
-        previous_score=0.0,
-        new_score=resilience_score,
-        reason=f"Dashboard attack test: {passed}/{total} passed",
-        event_type="attack_test",
-        session_id=session_id,
-    )
-
-    update_sandbox_session(
-        session_id=session_id,
-        results_summary={
-            "total_attacks": total,
-            "passed": passed,
-            "failed": total - passed,
-            "resilience_score": resilience_score,
-            "attack_results": results,
-        },
-    )
-
-    return {
-        "session_id": session_id,
-        "total_attacks": total,
-        "passed": passed,
-        "failed": total - passed,
-        "resilience_score": resilience_score,
-        "results": results,
     }
 
 

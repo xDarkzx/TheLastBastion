@@ -21,7 +21,7 @@ import logging
 import os
 import secrets
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -161,8 +161,10 @@ class RateLimiter:
     """
 
     def __init__(self, default_limit: int = 60) -> None:
-        # agent_id -> list of request timestamps
-        self._requests: Dict[str, List[float]] = defaultdict(list)
+        # agent_id -> deque of request timestamps, oldest first (append-only,
+        # so it's always sorted — lets us evict expired entries from the left
+        # in O(expired) instead of rebuilding the whole list every call)
+        self._requests: Dict[str, deque] = defaultdict(deque)
         self._default_limit = default_limit
         self._last_cleanup = time.time()
 
@@ -178,13 +180,12 @@ class RateLimiter:
         now = time.time()
         window_start = now - 60  # 1-minute sliding window
 
-        # Clean old requests
-        self._requests[agent_id] = [
-            t for t in self._requests[agent_id]
-            if t > window_start
-        ]
+        # Evict expired entries from the front only
+        requests = self._requests[agent_id]
+        while requests and requests[0] <= window_start:
+            requests.popleft()
 
-        current_count = len(self._requests[agent_id])
+        current_count = len(requests)
         remaining = max(0, max_requests - current_count)
 
         if current_count >= max_requests:
@@ -194,7 +195,7 @@ class RateLimiter:
             )
             return False, 0
 
-        self._requests[agent_id].append(now)
+        requests.append(now)
 
         # Periodic cleanup: evict stale agent entries every 5 minutes
         if now - self._last_cleanup > 300:
@@ -414,6 +415,10 @@ class M2MAuthenticator:
     ) -> Tuple[bool, str]:
         """
         Full authentication pipeline for a protocol message.
+
+        DEPRECATED path — see protocols/agent_protocol.py's module docstring.
+        No live /m2m/* endpoint calls this; Bastion Protocol's handshake
+        (sdk/lastbastion/protocol/handshake.py) is the current equivalent.
 
         Returns: (is_authenticated, reason)
         """

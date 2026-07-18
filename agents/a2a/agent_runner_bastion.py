@@ -20,7 +20,6 @@ Environment:
     DEMO_DECAY_MODE     — 1 = accelerated timers for demo visibility
 """
 import asyncio
-import json
 import logging
 import os
 import random
@@ -39,12 +38,19 @@ from agents.a2a.producer_agent import create_producer_agent
 from agents.a2a.compliance_agent import create_compliance_agent
 from agents.a2a.logistics_agent import create_logistics_agent
 from agents.a2a.buyer_agent import create_buyer_agent
+from lastbastion.crypto import load_or_create_keypair, load_or_create_issuer_keypair
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger("A2A.BastionRunner")
+
+# Anchored to the project root, not the process's CWD — a bare relative path
+# would silently regenerate "persistent" keys every time this script is
+# launched from a different working directory (it's explicitly designed to
+# run standalone on a separate host, so this matters more here than anywhere).
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # ───────────────────────────────────────────────────────────────
 # Configuration
@@ -83,6 +89,14 @@ class AutonomousAgent:
         self.role = cfg["role"]
         self.capabilities = cfg["capabilities"]
 
+        # Persistent Ed25519 identity — same key every run, same key used for
+        # both register() and verify() (previously these each sent a fresh
+        # secrets.token_hex(32) throwaway key, so the agent never actually had
+        # a stable, private-key-backed identity).
+        self.public_key, self.private_key = load_or_create_keypair(
+            os.path.join(_PROJECT_ROOT, ".agent_keys", f"{self.name}.keys.json")
+        )
+
         # State — populated after registration/verification
         self.api_key_id: str = ""
         self.api_secret: str = ""
@@ -105,7 +119,7 @@ class AutonomousAgent:
         try:
             resp = await client.post(f"{REGISTRY_BASE_URL}/m2m/register", json={
                 "agent_id": self.m2m_id,
-                "public_key": secrets.token_hex(32),
+                "public_key": self.public_key,
                 "role": self.role,
                 "display_name": self.label,
                 "capabilities": self.capabilities,
@@ -133,7 +147,7 @@ class AutonomousAgent:
                     "agent_id": self.m2m_id,
                     "agent_name": self.label,
                     "agent_url": f"http://localhost:{self.cfg['a2a_port']}",
-                    "public_key": secrets.token_hex(32),
+                    "public_key": self.public_key,
                     "capabilities": self.capabilities,
                 },
                 headers={
@@ -190,11 +204,12 @@ async def _do_bastion_trade(agents: list, client: httpx.AsyncClient, issuer_pub:
         from lastbastion.protocol import AgentSocket
         from lastbastion.passport import AgentPassport
 
-        # Create a passport for the sender
+        # Create a passport for the sender — public_key is the SENDER's own
+        # persistent identity key, not the issuer key.
         passport = AgentPassport(
             agent_id=sender.m2m_id,
             agent_name=sender.label,
-            public_key=issuer_pub,
+            public_key=sender.public_key,
             trust_score=sender.trust_score,
             trust_level="VERIFIED" if sender.trust_score >= 0.70 else "BASIC",
             verdict=sender.trust_verdict,
@@ -432,10 +447,13 @@ async def start_bastion_servers(issuer_pub: str, issuer_priv: str):
     servers = []
     for cfg in AGENT_CONFIGS:
         try:
+            agent_public_key, _agent_private_key = load_or_create_keypair(
+                os.path.join(_PROJECT_ROOT, ".agent_keys", f"{cfg['name']}.keys.json")
+            )
             passport = AgentPassport(
                 agent_id=cfg["m2m_id"],
                 agent_name=cfg["label"],
-                public_key=issuer_pub,
+                public_key=agent_public_key,
                 trust_score=0.92,
                 trust_level="VERIFIED",
                 verdict="TRUSTED",
@@ -497,27 +515,13 @@ async def main():
     print("=" * 60)
     print()
 
-    # Generate or load issuer keypair
-    issuer_pub = os.environ.get("BASTION_ISSUER_PUB", "")
-    issuer_priv = os.environ.get("BASTION_ISSUER_PRIV", "")
-
-    if not issuer_pub or not issuer_priv:
-        from lastbastion.crypto import generate_keypair
-        issuer_pub, issuer_priv = generate_keypair()
-        logger.info(f"Generated issuer keypair: pub={issuer_pub[:16]}...")
-        print(f"\n  BASTION_ISSUER_PUB={issuer_pub}")
-        print(f"  BASTION_ISSUER_PRIV={issuer_priv}")
-    else:
-        logger.info(f"Using provided issuer keypair: pub={issuer_pub[:16]}...")
-
-    # Save keypair to file for easy sharing
-    keys_file = os.path.join(os.path.dirname(__file__), "..", "..", ".bastion_keys.json")
-    try:
-        with open(keys_file, "w") as f:
-            json.dump({"issuer_pub": issuer_pub, "issuer_priv": issuer_priv}, f)
-        logger.info(f"Saved issuer keys to {keys_file}")
-    except Exception:
-        pass
+    # Issuer keypair — env vars first, then the shared local file (read AND
+    # written, unlike the old version of this block which only ever wrote the
+    # file and never read it back, so it minted a brand new issuer identity —
+    # invalidating every previously-issued passport — on every single restart).
+    keys_file = os.path.join(_PROJECT_ROOT, ".bastion_keys.json")
+    issuer_pub, issuer_priv = load_or_create_issuer_keypair(keys_file)
+    logger.info(f"Issuer keypair: pub={issuer_pub[:16]}...")
 
     print()
     logger.info("Starting A2A HTTP servers...")

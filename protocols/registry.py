@@ -174,6 +174,8 @@ class AgentRegistry:
 
         # Register The Last Bastion's own services
         self._register_registry_base_services()
+        # Restore externally-registered services that survived a restart
+        self._load_persisted_services()
 
     def register_agent(
         self, identity: AgentIdentity
@@ -204,7 +206,7 @@ class AgentRegistry:
             "protocol_version": "1.0.0",
         }
 
-    def deregister_agent(self, agent_id: str) -> bool:
+    async def deregister_agent(self, agent_id: str) -> bool:
         """Removes an agent from the registry."""
         if agent_id not in self._agents:
             return False
@@ -219,16 +221,31 @@ class AgentRegistry:
         self._stats["total_agents"] -= 1
         self._stats["active_agents"] -= 1
 
+        try:
+            import asyncio
+            from core.database import deactivate_service_listings_for_provider
+            await asyncio.to_thread(deactivate_service_listings_for_provider, agent_id)
+        except Exception as e:
+            logger.warning(f"Deregister: DB service cleanup failed for {agent_id}: {e}")
+
         logger.info(f"Deregistered agent: {agent_id}")
         return True
 
-    def register_service(
+    async def register_service(
         self, agent_id: str, listing: ServiceListing
     ) -> bool:
         """
         Registers a service offered by an agent.
 
-        Only registered agents can offer services.
+        Only registered agents can offer services. Persisted to DB so
+        externally-registered services survive a restart — without this,
+        every server bounce silently wiped the entire external service
+        catalog and providers had no way to know they needed to re-register.
+
+        The DB write runs via asyncio.to_thread — see QuotationEngine for why
+        that matters: a bare synchronous DB call here would block the whole
+        event loop, stalling every other concurrent request for the duration
+        of the write.
         """
         if agent_id not in self._agents:
             logger.warning(f"Cannot register service: agent {agent_id} not registered")
@@ -239,11 +256,61 @@ class AgentRegistry:
         self._agent_services[agent_id].append(listing.service_id)
         self._stats["total_services"] += 1
 
+        try:
+            import asyncio
+            from core.database import save_service_listing
+            await asyncio.to_thread(
+                save_service_listing,
+                service_id=listing.service_id,
+                provider_id=agent_id,
+                name=listing.name,
+                description=listing.description,
+                tags=listing.tags,
+                input_schema=listing.input_schema,
+                output_schema=listing.output_schema,
+                pricing_model=listing.pricing_model,
+                base_price_credits=listing.base_price_credits,
+                regions=listing.regions,
+            )
+        except Exception as e:
+            logger.warning(f"Service registration: DB persist failed for {listing.service_id}: {e}")
+
         logger.info(
             f"Service registered: {listing.name} "
             f"(id={listing.service_id}, provider={agent_id})"
         )
         return True
+
+    def _load_persisted_services(self) -> None:
+        """Restores externally-registered services from DB on startup."""
+        try:
+            from core.database import load_all_service_listings
+            records = load_all_service_listings()
+        except Exception as e:
+            logger.warning(f"Could not load persisted services: {e}")
+            return
+
+        for r in records:
+            if r["service_id"] in self._services:
+                continue  # Don't clobber built-in Registry Base services
+            listing = ServiceListing(
+                service_id=r["service_id"],
+                provider_id=r["provider_id"],
+                name=r["name"],
+                description=r["description"],
+                tags=r["tags"],
+                input_schema=r["input_schema"],
+                output_schema=r["output_schema"],
+                pricing_model=r["pricing_model"],
+                base_price_credits=r["base_price_credits"],
+                regions=r["regions"],
+            )
+            self._services[listing.service_id] = listing
+            self._agent_services[listing.provider_id].append(listing.service_id)
+            self._stats["total_services"] += 1
+
+        if records:
+            logger.info(f"Restored {len(records)} persisted service listings")
 
     def discover_services(
         self,

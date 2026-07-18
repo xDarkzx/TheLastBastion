@@ -71,6 +71,12 @@ class BorderGuard:
         self.api_secret = api_secret
         self._client = httpx.AsyncClient(timeout=API_TIMEOUT)
 
+    def _auth_headers(self) -> Dict[str, str]:
+        """Headers for endpoints that require an API key."""
+        if not self.api_key_id:
+            return {}
+        return {"x-api-key-id": self.api_key_id, "x-api-secret": self.api_secret}
+
     async def check_passport(self, agent_id: str) -> PassportStatus:
         """Checks an agent's verification status (passport lookup)."""
         try:
@@ -135,6 +141,7 @@ class BorderGuard:
                     "payload": payload,
                     "payload_summary": payload_summary,
                 },
+                headers=self._auth_headers(),
             )
             resp.raise_for_status()
             data = resp.json()
@@ -166,6 +173,7 @@ class BorderGuard:
                     "handoff_id": handoff_id,
                     "action": "accept",
                 },
+                headers=self._auth_headers(),
             )
             resp.raise_for_status()
             return resp.json()
@@ -185,6 +193,7 @@ class BorderGuard:
                     "action": "reject",
                     "reason": reason,
                 },
+                headers=self._auth_headers(),
             )
             resp.raise_for_status()
             return resp.json()

@@ -20,7 +20,7 @@ from typing import Dict, List, Optional
 
 import aiohttp
 
-from lastbastion.crypto import generate_keypair
+from lastbastion.crypto import load_or_create_issuer_keypair, load_or_create_keypair
 from lastbastion.passport import AgentPassport
 from lastbastion.protocol.frames import (
     BastionFrame,
@@ -38,6 +38,13 @@ from lastbastion.protocol.handshake import (
 )
 
 logger = logging.getLogger("BorderPolice")
+
+# Anchored to the project root, NOT the process's current working directory —
+# a bare relative path like ".agent_keys/x.json" resolves against whatever
+# directory the process happened to be launched from, so "persistent" identity
+# would silently break (regenerate) the moment this is launched from anywhere
+# else (a systemd unit, a different shell, a Docker WORKDIR).
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 BORDER_POLICE_PORT = 9200
 
@@ -687,10 +694,19 @@ class BorderAgent:
         self._active_sessions: Dict[str, dict] = {}
         self._connection_count = 0
 
-        # Generate the Border Police's own identity
-        self.public_key, self.private_key = generate_keypair()
-        # Issuer keys (in production from The Last Bastion CA)
-        self.issuer_pub, self.issuer_priv = generate_keypair()
+        # Border Police's own identity — persisted so it's stable across restarts
+        self.public_key, self.private_key = load_or_create_keypair(
+            os.path.join(_PROJECT_ROOT, ".agent_keys", "border-police.keys.json")
+        )
+        # Issuer keys (in production from The Last Bastion CA). Persisted/shared
+        # via the same file+env resolution used by agent_simulator.py and
+        # agent_runner_bastion.py — all three MUST agree on the issuer identity,
+        # since a passport is only valid if signed by an issuer key the verifier
+        # already recognizes. A fresh random issuer key per process would make
+        # every previously-issued passport instantly unverifiable here.
+        self.issuer_pub, self.issuer_priv = load_or_create_issuer_keypair(
+            os.path.join(_PROJECT_ROOT, ".bastion_keys.json")
+        )
 
         self.passport = AgentPassport(
             agent_id="border-police-001",
@@ -769,17 +785,14 @@ class BorderAgent:
                 await self._send_error(writer, "No passport in HELLO", conn_id)
                 return
 
-            # Extract issuer key from the raw passport data
-            import msgpack
-            raw_claims = msgpack.unpackb(passport_signed[:-64], raw=False)
-            issuer_pub = raw_claims.get("issuer_public_key", "")
-
-            if not issuer_pub:
-                await self._send_error(writer, "Passport missing issuer key", conn_id)
-                return
-
+            # Verify the passport signature against OUR OWN pinned issuer key —
+            # never a key read out of the untrusted payload itself. Extracting
+            # "issuer_public_key" from the incoming claims and verifying against
+            # that would let any attacker self-issue a passport claiming
+            # trust_score=1.0/verdict=TRUSTED, since they'd be signing with a
+            # key they also control and we'd be told to trust it.
             try:
-                peer_passport = AgentPassport.from_signed_bytes(passport_signed, issuer_pub)
+                peer_passport = AgentPassport.from_signed_bytes(passport_signed, self.issuer_pub)
             except ValueError as e:
                 await self._send_error(
                     writer,
@@ -820,7 +833,7 @@ class BorderAgent:
             responder = HandshakeResponder(
                 passport=self.passport,
                 signing_key=self.issuer_priv,
-                verify_key=issuer_pub,
+                verify_key=self.issuer_pub,
                 min_trust_score=0.0,
             )
 

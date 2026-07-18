@@ -65,6 +65,7 @@ class LastBastionGateway:
         self._verifier = PassportVerifier(issuer_public_key=issuer_public_key)
         self._cache: Dict[str, Dict[str, Any]] = {}  # jwt_hash -> {decision, expires}
         self._budget_tracker: Dict[str, Dict[str, Any]] = {}  # passport_id -> budget info
+        self._last_budget_evict = time.time()
 
     def _trust_sufficient(self, level: str) -> bool:
         """Check if a trust level meets the minimum threshold."""
@@ -78,7 +79,7 @@ class LastBastionGateway:
     def _get_cached(self, jwt_token: str) -> Optional[GatewayDecision]:
         """Check cache for a previously verified passport."""
         import hashlib
-        key = hashlib.sha256(jwt_token.encode()).hexdigest()[:16]
+        key = hashlib.sha256(jwt_token.encode()).hexdigest()
         entry = self._cache.get(key)
         if entry and entry["expires"] > time.time():
             decision = entry["decision"]
@@ -97,7 +98,7 @@ class LastBastionGateway:
     def _set_cached(self, jwt_token: str, decision: GatewayDecision):
         """Cache a verification decision."""
         import hashlib
-        key = hashlib.sha256(jwt_token.encode()).hexdigest()[:16]
+        key = hashlib.sha256(jwt_token.encode()).hexdigest()
         # Evict old entries if cache grows too large
         if len(self._cache) > 1000:
             now = time.time()
@@ -235,6 +236,7 @@ class LastBastionGateway:
                 # Budget exhausted — do NOT cache (agent might re-verify)
                 return budget_decision
             self._decrement_budget(passport)
+            self._maybe_sync_budget(passport.passport_id)
 
         budget_info = self._get_budget_info(passport.passport_id) if passport else None
 
@@ -251,18 +253,41 @@ class LastBastionGateway:
         self._set_cached(jwt_token, decision)
         return decision
 
+    # Budget entries not touched in this long are evicted -- passports get a
+    # fresh passport_id on every renewal, so with no eviction this dict grows
+    # for the life of the process even under ordinary legitimate traffic.
+    _BUDGET_ENTRY_TTL_SECONDS = 3600
+    _BUDGET_EVICT_INTERVAL_SECONDS = 300
+
     def _init_budget(self, passport: AgentPassport):
         """Initialize budget tracker from passport if first seen."""
+        self._maybe_evict_stale_budgets()
         pid = passport.passport_id
         if pid not in self._budget_tracker:
             self._budget_tracker[pid] = {
                 "remaining": passport.interaction_budget,
                 "max": passport.interaction_budget_max,
                 "last_sync": time.time(),
+                "last_seen": time.time(),
                 "agent_id": passport.agent_id,
                 "strikes": 0,
                 "escalation_tier": 0,
             }
+        else:
+            self._budget_tracker[pid]["last_seen"] = time.time()
+
+    def _maybe_evict_stale_budgets(self):
+        """Periodically drops budget entries idle longer than the TTL."""
+        now = time.time()
+        if now - self._last_budget_evict < self._BUDGET_EVICT_INTERVAL_SECONDS:
+            return
+        self._last_budget_evict = now
+        stale = [
+            pid for pid, info in self._budget_tracker.items()
+            if now - info.get("last_seen", 0) > self._BUDGET_ENTRY_TTL_SECONDS
+        ]
+        for pid in stale:
+            del self._budget_tracker[pid]
 
     @staticmethod
     def _tier_for_strikes(strikes: int) -> Optional[int]:
@@ -330,10 +355,31 @@ class LastBastionGateway:
         info = self._budget_tracker.get(pid)
         if info:
             info["remaining"] = max(0, info["remaining"] - 1)
+            info["last_seen"] = time.time()
 
     def _get_budget_info(self, passport_id: str) -> Optional[Dict[str, Any]]:
         """Get current budget info for a passport."""
         return self._budget_tracker.get(passport_id)
+
+    def _maybe_sync_budget(self, passport_id: str):
+        """
+        Fires a background sync_budget() once budget_sync_interval has
+        elapsed since the last sync. Without this, budget_sync_interval was
+        stored on the instance but never actually used anywhere — the local
+        in-memory counter never reconciled with the server, so it reset on
+        every restart and never agreed with any other replica tracking the
+        same passport.
+        """
+        info = self._budget_tracker.get(passport_id)
+        if not info or not self.api_key:
+            return
+        if time.time() - info.get("last_sync", 0) < self.budget_sync_interval:
+            return
+        try:
+            import asyncio
+            asyncio.ensure_future(self.sync_budget(passport_id))
+        except RuntimeError:
+            pass  # No running event loop — skip this cycle
 
     async def sync_budget(self, passport_id: str):
         """Sync budget with server via POST /passport/budget/sync."""

@@ -154,10 +154,17 @@ class LastBastionClient:
         If the server has REQUIRE_CHALLENGE=false, registration completes
         immediately and returns an API key.
         """
+        if not public_key:
+            raise ValidationError(
+                "public_key is required — generate one with "
+                "LastBastionClient.generate_keypair() rather than registering "
+                "with a placeholder key",
+                status_code=422,
+            )
         client = await self._get_client()
         resp = await client.post("/m2m/register", json={
             "agent_id": agent_id,
-            "public_key": public_key or f"ed25519_pub_{agent_id}",
+            "public_key": public_key,
             "role": role,
             "capabilities": capabilities or [],
             "display_name": display_name or agent_id,
@@ -326,18 +333,6 @@ class LastBastionClient:
         resp = await client.post("/sandbox/sessions", json={
             "agent_id": agent_id,
             "config": config or {},
-        })
-        return self._handle_response(resp)
-
-    async def run_attacks(
-        self,
-        session_id: str,
-        attack_types: List[str] = None,
-    ) -> dict:
-        """Run attack simulations against an agent in a session."""
-        client = await self._get_client()
-        resp = await client.post(f"/sandbox/sessions/{session_id}/attacks", json={
-            "attack_types": attack_types or [],
         })
         return self._handle_response(resp)
 

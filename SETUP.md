@@ -41,7 +41,7 @@ That's it. No Python, no Node.js, no package managers. Docker handles everything
 
 ```bash
 git clone https://github.com/xDarkzx/TheLastBastion.git
-cd the-last-bastion
+cd TheLastBastion
 ```
 
 ---
@@ -289,26 +289,27 @@ docker-compose up
 ## Project Structure
 
 ```
-the-last-bastion/
+TheLastBastion/
 ├── regional_core.py          # FastAPI entrypoint
 ├── core/                     # Backend logic
 │   ├── database.py           # All models + DB helpers
 │   ├── m2m_router.py         # M2M + refinery API endpoints
 │   ├── agent_verifier.py     # 10-check trust pipeline
 │   ├── agent_simulator.py    # A2A agent network
-│   ├── verification/         # 5-layer verification stack
-│   │   ├── pipeline.py       # Verification entry point
-│   │   ├── schema_gatekeeper.py
-│   │   ├── consistency.py
-│   │   ├── forensic_integrity.py
-│   │   ├── logic_triangulation.py
-│   │   ├── attestation.py
-│   │   └── adversarial.py
-│   └── attacks/              # Sandbox attack framework
+│   ├── border_agent.py       # Bastion Protocol reference server
+│   └── verification/         # 5-layer verification stack
+│       ├── pipeline.py       # Verification entry point
+│       ├── schema_gatekeeper.py
+│       ├── consistency.py
+│       ├── forensic_integrity.py
+│       ├── logic_triangulation.py
+│       ├── attestation.py
+│       └── adversarial.py
 ├── agents/                   # Agent workers
 │   └── a2a/                  # A2A protocol agents
 ├── sdk/                      # Python SDK
-│   └── lastbastion/          # Client, gateway, MCP tools
+│   └── lastbastion/
+│       └── protocol/         # Bastion Protocol — frames, handshake, sockets
 ├── contracts/                # Solidity smart contracts
 │   └── src/                  # SwarmProofRegistry, SwarmAgentRegistry
 ├── frontend/                 # React dashboard

@@ -35,7 +35,7 @@ from protocols.agent_protocol import (
     ProtocolMessage,
     PROTOCOL_VERSION,
 )
-from protocols.auth import M2MAuthenticator, sign_message
+from protocols.auth import M2MAuthenticator, RateLimiter, sign_message
 from protocols.registry import AgentRegistry
 from protocols.quotation import QuotationEngine
 from core.verification.pipeline import VerificationPipeline
@@ -124,6 +124,15 @@ logger = logging.getLogger("M2M_API")
 authenticator = M2MAuthenticator(db_session_factory=SessionLocal)
 registry = AgentRegistry()
 quotation = QuotationEngine()
+
+# /m2m/register and /m2m/register/verify are the ONE thing an attacker can
+# call with zero prior authentication (that's the point — it's how you get
+# credentials in the first place). Without a per-IP limit here, a script can
+# mint unlimited fake agent_ids, each granted 50 DB-persisted starter credits
+# and a permanent AgentRegistry entry — a Sybil/resource-exhaustion path that
+# per-agent_id rate limiting can never catch, since every fake identity
+# starts its own fresh counter. Keyed by client IP, not agent_id.
+_registration_rate_limiter = RateLimiter(default_limit=5)
 blockchain_anchor = BlockchainAnchor()  # Reads env vars, gracefully degrades
 verification_pipeline = VerificationPipeline(
     blockchain_anchor=blockchain_anchor,
@@ -355,19 +364,36 @@ class SimulateBehaviorRequest(BaseModel):
 _sim_rate: Dict[str, List[float]] = {}
 _SIM_RATE_LIMIT = 10
 _SIM_RATE_WINDOW = 60.0
+_SIM_RATE_SWEEP_INTERVAL = 300.0
+_last_sim_rate_sweep = 0.0
 
 
 def _check_sim_rate(agent_id: str) -> bool:
     """Returns True if allowed, False if rate limited."""
     now = _time.time()
     key = f"sim:{agent_id}"
-    if key not in _sim_rate:
-        _sim_rate[key] = []
     # Prune old entries
-    _sim_rate[key] = [t for t in _sim_rate[key] if now - t < _SIM_RATE_WINDOW]
-    if len(_sim_rate[key]) >= _SIM_RATE_LIMIT:
+    pruned = [t for t in _sim_rate.get(key, []) if now - t < _SIM_RATE_WINDOW]
+    if len(pruned) >= _SIM_RATE_LIMIT:
+        _sim_rate[key] = pruned
         return False
-    _sim_rate[key].append(now)
+    pruned.append(now)
+    _sim_rate[key] = pruned
+
+    # Every distinct agent_id that ever calls this creates a dict key that,
+    # without this, is never removed even once its list is empty again —
+    # unbounded growth keyed by (attacker-controllable) agent_id. Sweep
+    # empty/expired keys periodically rather than on every call.
+    global _last_sim_rate_sweep
+    if now - _last_sim_rate_sweep > _SIM_RATE_SWEEP_INTERVAL:
+        _last_sim_rate_sweep = now
+        stale_keys = [
+            k for k, ts in _sim_rate.items()
+            if not ts or now - ts[-1] > _SIM_RATE_WINDOW
+        ]
+        for k in stale_keys:
+            del _sim_rate[k]
+
     return True
 
 
@@ -375,8 +401,12 @@ def _check_sim_rate(agent_id: str) -> bool:
 # M2M ENDPOINTS
 # ---------------------------------------------------------------------------
 
+def _client_ip(http_request: Request) -> str:
+    return http_request.client.host if http_request.client else "unknown"
+
+
 @router.post("/register")
-async def m2m_register(request: RegisterRequest):
+async def m2m_register(request: RegisterRequest, http_request: Request):
     """
     Register an external agent with The Last Bastion.
 
@@ -388,6 +418,9 @@ async def m2m_register(request: RegisterRequest):
       Legacy behavior — issues key immediately (for backward compat).
     """
     _t0 = _time.monotonic()
+    allowed, _remaining = _registration_rate_limiter.check(_client_ip(http_request))
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Too many registration attempts — try again later")
     try:
         role = AgentRole(request.role)
     except ValueError:
@@ -444,7 +477,7 @@ async def m2m_register(request: RegisterRequest):
     authenticator.register_agent(identity)
     result = registry.register_agent(identity)
     key_id, raw_secret = authenticator.issue_api_key(request.agent_id)
-    balance = quotation.add_credits(request.agent_id, 50.0)
+    balance = await quotation.add_credits(request.agent_id, 50.0)
 
     logger.info(f"M2M REGISTER (legacy): {request.agent_id} (role={role.value})")
     protocol_bus.record(
@@ -471,7 +504,7 @@ async def m2m_register(request: RegisterRequest):
 
 
 @router.post("/register/verify")
-async def m2m_register_verify(request: ChallengeVerifyRequest):
+async def m2m_register_verify(request: ChallengeVerifyRequest, http_request: Request):
     """
     Complete challenge-response registration.
 
@@ -480,6 +513,9 @@ async def m2m_register_verify(request: ChallengeVerifyRequest):
     creates AgentVerification at trust=0.42 (NEW).
     """
     _t0 = _time.monotonic()
+    allowed, _remaining = _registration_rate_limiter.check(_client_ip(http_request))
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Too many registration attempts — try again later")
     challenge = get_registration_challenge(request.challenge_id)
     if not challenge:
         raise HTTPException(status_code=404, detail="Challenge not found")
@@ -542,7 +578,7 @@ async def m2m_register_verify(request: ChallengeVerifyRequest):
     key_id, raw_secret = authenticator.issue_api_key(
         agent_id, environment="sandbox", rate_limit=10,
     )
-    balance = quotation.add_credits(agent_id, 50.0)
+    balance = await quotation.add_credits(agent_id, 50.0)
 
     # Auto-create AgentVerification at NEW trust level (0.42)
     save_agent_verification(
@@ -692,10 +728,11 @@ async def m2m_quote(
         processing_ms=(_time.monotonic() - _t0) * 1000,
     )
 
+    balance = await quotation.get_balance(agent_id)
     return {
         "quote": quote.to_dict(),
-        "your_balance": quotation.get_balance(agent_id),
-        "can_afford": quotation.get_balance(agent_id) >= quote.estimated_credits,
+        "your_balance": balance,
+        "can_afford": balance >= quote.estimated_credits,
     }
 
 
@@ -734,7 +771,7 @@ async def m2m_submit(
         pass
 
     # Accept the quote (deducts credits)
-    accepted = quotation.accept_quote(request.quote_id)
+    accepted = await quotation.accept_quote(request.quote_id)
     if not accepted:
         raise HTTPException(
             status_code=402,

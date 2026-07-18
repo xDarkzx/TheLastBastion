@@ -88,6 +88,8 @@ class FrameType(IntEnum):
     PONG = 0x09
     ERROR = 0x0A
     CLOSE = 0x0B
+    RESUME = 0x0C        # Resume a prior session via ticket (skips full DH handshake)
+    RESUME_ACK = 0x0D    # Resumption accepted — carries fresh server nonce + next ticket
 
 
 class FrameFlags(IntFlag):
@@ -102,7 +104,12 @@ class FrameFlags(IntFlag):
 
 # Frames that don't carry encrypted payloads
 # ERROR is unencrypted so crypto failures can still report errors
-UNENCRYPTED_TYPES = {FrameType.HELLO, FrameType.HELLO_ACK, FrameType.ERROR}
+# RESUME/RESUME_ACK are unencrypted for the same reason HELLO is — there's no
+# session key yet at this point in either handshake path
+UNENCRYPTED_TYPES = {
+    FrameType.HELLO, FrameType.HELLO_ACK, FrameType.ERROR,
+    FrameType.RESUME, FrameType.RESUME_ACK,
+}
 
 # Frames that must terminate the connection on error
 FATAL_TYPES = {FrameType.ERROR}
@@ -128,6 +135,10 @@ class ErrorCode(IntEnum):
     PING_TIMEOUT = 1011
     BUDGET_EXHAUSTED = 1012
     AGENT_LOCKED_OUT = 1013
+    TICKET_INVALID = 1014       # Resumption ticket expired/tampered/unknown — fall back to full HELLO
+    TICKET_REPLAYED = 1015      # Resumption ticket already used once (single-use)
+    KEY_MISMATCH = 1016         # DIRECT mode: claimed public key doesn't match the pinned one
+    PEER_REVOKED = 1017         # DIRECT mode: peer's pin was explicitly revoked
 
 
 # Fatal error codes -- connection MUST be closed after these
@@ -141,6 +152,15 @@ FATAL_ERROR_CODES = {
     ErrorCode.SIGNATURE_FAILED,
     ErrorCode.DECRYPTION_FAILED,
     ErrorCode.AGENT_LOCKED_OUT,
+    ErrorCode.KEY_MISMATCH,
+    ErrorCode.PEER_REVOKED,
+}
+
+# Non-fatal — the client should fall back to a full HELLO handshake (on a new
+# connection attempt) rather than treat these as a hard security failure
+RESUMPTION_RETRY_CODES = {
+    ErrorCode.TICKET_INVALID,
+    ErrorCode.TICKET_REPLAYED,
 }
 
 
@@ -299,15 +319,43 @@ class FrameEncoder:
     Raises OverflowError when sequence exceeds 2^32-1 (reconnect required).
     """
 
-    def __init__(self, passport_hash: bytes, signing_key: str = ""):
+    # Non-zero placeholder used when sign_data_frames=False -- satisfies
+    # FrameDecoder's post-handshake "signature must be non-zero" structural
+    # check without paying for a real Ed25519 signature that nothing verifies
+    # anyway (see FrameEncoder docstring for why that's safe).
+    _UNSIGNED_PLACEHOLDER = b"\x01" + b"\x00" * (SIGNATURE_SIZE - 1)
+
+    def __init__(self, passport_hash: bytes, signing_key: str = "", sign_data_frames: bool = True):
         """
         Args:
             passport_hash: 32-byte passport identifier (full SHA-256)
             signing_key: Ed25519 private key (hex) for signing frames
+            sign_data_frames: Whether to compute a REAL Ed25519 signature for
+                every frame (default True — matches original behavior).
+
+                Set False for an encoder used only for POST-HANDSHAKE traffic
+                (DATA/PING/PONG/etc) where the receiving FrameDecoder has no
+                verify_key configured, which is the common pattern: post-
+                handshake authenticity comes from NaCl SecretBox's
+                authenticated encryption on the payload (tampering fails
+                decryption), not from a per-frame signature the receiver
+                never checks. Measured: real per-frame Ed25519 signing was
+                the dominant cost making Bastion DATA-frame throughput ~5x
+                SLOWER than plain unencrypted JSON for small messages —
+                pure waste when nothing verifies the result.
+
+                Do NOT set this False for an encoder used to build
+                HELLO/HELLO_ACK/RESUME_ACK -- those signatures ARE verified
+                (that's the actual identity proof) and must stay real. In
+                practice this is naturally safe because handshake frames are
+                built by separate FrameEncoder instances constructed inside
+                handshake.py, not the one an AgentConnection uses for
+                ongoing traffic.
         """
         self._passport_hash = passport_hash[:PASSPORT_HASH_SIZE]
         self._signing_key = signing_key
         self._sequence = 0
+        self._sign_data_frames = sign_data_frames
 
     @property
     def next_sequence(self) -> int:
@@ -368,7 +416,12 @@ class FrameEncoder:
         )
 
         # Sign (covers header + payload, including timestamp — tamper-proof)
-        frame.signature = self._sign(frame.signable_bytes)
+        # when sign_data_frames is enabled; otherwise a cheap non-zero
+        # placeholder (see __init__ docstring for when that's safe).
+        if self._sign_data_frames:
+            frame.signature = self._sign(frame.signable_bytes)
+        else:
+            frame.signature = self._UNSIGNED_PLACEHOLDER
 
         # Increment sequence for next frame
         self._sequence += 1

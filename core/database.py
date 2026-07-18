@@ -669,6 +669,31 @@ class PersistentAPIKey(Base):
     organization = relationship("SandboxOrganization", back_populates="api_keys")
 
 
+class CreditBalance(Base):
+    """DB-backed M2M credit balance — survives restarts, deducted atomically."""
+    __tablename__ = 'credit_balances'
+    agent_id = Column(String(100), primary_key=True)
+    balance = Column(Float, default=0.0, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ServiceListingRecord(Base):
+    """DB-backed service listing — survives restarts (AgentRegistry.register_service)."""
+    __tablename__ = 'service_listings'
+    service_id = Column(String(100), primary_key=True)
+    provider_id = Column(String(100), nullable=False, index=True)
+    name = Column(String(200), nullable=False)
+    description = Column(Text, default="")
+    tags = Column(JSON, default=list)
+    input_schema = Column(JSON, default=dict)
+    output_schema = Column(JSON, default=dict)
+    pricing_model = Column(String(30), default="per_request")
+    base_price_credits = Column(Float, default=1.0)
+    regions = Column(JSON, default=list)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class SandboxSession(Base):
     """Tracks a sandbox test run."""
     __tablename__ = 'sandbox_sessions'
@@ -2395,6 +2420,162 @@ def load_all_api_keys() -> list:
     except Exception as e:
         logger.error("load_all_api_keys failed: %s", e)
         return []
+    finally:
+        db.close()
+
+
+def get_credit_balance(agent_id: str) -> float:
+    """Returns an agent's persisted credit balance (0.0 if no row yet)."""
+    db = SessionLocal()
+    try:
+        record = db.query(CreditBalance).filter(CreditBalance.agent_id == agent_id).first()
+        return record.balance if record else 0.0
+    finally:
+        db.close()
+
+
+def add_credit_balance(agent_id: str, amount: float) -> float:
+    """Adds credits to an agent's persisted balance, creating the row if needed. Returns new balance."""
+    db = SessionLocal()
+    try:
+        record = db.query(CreditBalance).filter(CreditBalance.agent_id == agent_id).first()
+        if record is None:
+            record = CreditBalance(agent_id=agent_id, balance=0.0)
+            db.add(record)
+            db.flush()
+        record.balance = (record.balance or 0.0) + amount
+        db.commit()
+        db.refresh(record)
+        return record.balance
+    except Exception as e:
+        db.rollback()
+        logger.error("add_credit_balance failed: %s", e)
+        raise
+    finally:
+        db.close()
+
+
+def deduct_credit_balance(agent_id: str, amount: float) -> bool:
+    """
+    Atomically deducts credits if the agent has enough balance.
+
+    Uses a single conditional UPDATE (WHERE balance >= amount) so the
+    check-then-deduct can't race across concurrent requests or worker
+    processes — the database enforces atomicity here, not an in-process lock
+    (which wouldn't help anyway once there's more than one worker process,
+    since each process would otherwise hold its own separate in-memory ledger).
+
+    Returns True if the deduction succeeded, False if balance was insufficient
+    or the agent has no balance row yet — a genuine business decision the
+    caller should treat as final. A DB/connection error is a different kind
+    of failure (we don't actually know whether the deduction happened) and is
+    RE-RAISED rather than folded into a plain False, so callers can tell "not
+    enough credits" apart from "couldn't reach the database" and decide how
+    to handle each (e.g. QuotationEngine.accept_quote falls back to an
+    in-memory check only on the latter).
+    """
+    db = SessionLocal()
+    try:
+        rows_updated = db.query(CreditBalance).filter(
+            CreditBalance.agent_id == agent_id,
+            CreditBalance.balance >= amount,
+        ).update(
+            {CreditBalance.balance: CreditBalance.balance - amount},
+            synchronize_session=False,
+        )
+        db.commit()
+        return rows_updated > 0
+    except Exception as e:
+        db.rollback()
+        logger.error("deduct_credit_balance failed: %s", e)
+        raise
+    finally:
+        db.close()
+
+
+def save_service_listing(
+    service_id: str,
+    provider_id: str,
+    name: str,
+    description: str = "",
+    tags: list = None,
+    input_schema: dict = None,
+    output_schema: dict = None,
+    pricing_model: str = "per_request",
+    base_price_credits: float = 1.0,
+    regions: list = None,
+) -> None:
+    """Persists (or updates) a service listing so it survives restarts."""
+    db = SessionLocal()
+    try:
+        record = db.query(ServiceListingRecord).filter(
+            ServiceListingRecord.service_id == service_id
+        ).first()
+        if record is None:
+            record = ServiceListingRecord(service_id=service_id, provider_id=provider_id, name=name)
+            db.add(record)
+        record.provider_id = provider_id
+        record.name = name
+        record.description = description
+        record.tags = tags or []
+        record.input_schema = input_schema or {}
+        record.output_schema = output_schema or {}
+        record.pricing_model = pricing_model
+        record.base_price_credits = base_price_credits
+        record.regions = regions or []
+        record.is_active = True
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error("save_service_listing failed: %s", e)
+    finally:
+        db.close()
+
+
+def load_all_service_listings() -> list:
+    """Loads all active externally-registered service listings for startup warm-load."""
+    db = SessionLocal()
+    try:
+        records = db.query(ServiceListingRecord).filter(
+            ServiceListingRecord.is_active == True
+        ).all()
+        return [
+            {
+                "service_id": r.service_id,
+                "provider_id": r.provider_id,
+                "name": r.name,
+                "description": r.description or "",
+                "tags": r.tags or [],
+                "input_schema": r.input_schema or {},
+                "output_schema": r.output_schema or {},
+                "pricing_model": r.pricing_model,
+                "base_price_credits": r.base_price_credits,
+                "regions": r.regions or [],
+                "created_at": r.created_at.isoformat() if r.created_at else "",
+            }
+            for r in records
+        ]
+    except Exception as e:
+        logger.error("load_all_service_listings failed: %s", e)
+        return []
+    finally:
+        db.close()
+
+
+def deactivate_service_listings_for_provider(provider_id: str) -> int:
+    """Deactivates all service listings owned by a provider (on deregister). Returns count affected."""
+    db = SessionLocal()
+    try:
+        rows_updated = db.query(ServiceListingRecord).filter(
+            ServiceListingRecord.provider_id == provider_id,
+            ServiceListingRecord.is_active == True,
+        ).update({ServiceListingRecord.is_active: False}, synchronize_session=False)
+        db.commit()
+        return rows_updated
+    except Exception as e:
+        db.rollback()
+        logger.error("deactivate_service_listings_for_provider failed: %s", e)
+        return 0
     finally:
         db.close()
 

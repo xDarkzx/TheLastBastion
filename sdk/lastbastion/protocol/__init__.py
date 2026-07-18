@@ -25,8 +25,37 @@ from lastbastion.protocol.frames import (
     PING_TIMEOUT_SECONDS,
     MAX_SEQUENCE,
 )
-from lastbastion.protocol.handshake import NonceRegistry, NONCE_CACHE_MAX
-from lastbastion.protocol.socket import AgentSocket, AgentConnection, PeerInfo, ProtocolMetrics
+from lastbastion.protocol.handshake import (
+    NonceRegistry,
+    NONCE_CACHE_MAX,
+    # DIRECT mode — no passport office required, key-pinned peer auth
+    DirectHandshakeInitiator,
+    DirectHandshakeResponder,
+    DirectHandshakeResult,
+    # Session resumption — skip the full handshake on reconnect
+    ResumptionResponder,
+    ResumeResult,
+    build_resume,
+    parse_resume,
+    complete_resume,
+)
+from lastbastion.protocol.resumption import (
+    derive_resumption_secret,
+    derive_resumed_session_key,
+    issue_ticket,
+    redeem_ticket,
+    TicketClaims,
+    DEFAULT_TICKET_TTL_SECONDS,
+)
+from lastbastion.protocol.trust_store import PeerTrustStore, PinResult
+from lastbastion.protocol.socket import (
+    AgentSocket,
+    AgentConnection,
+    PeerInfo,
+    ProtocolMetrics,
+    DirectAgentSocket,
+    DirectAgentSocketServer,
+)
 
 __all__ = [
     "FrameType",
@@ -39,6 +68,8 @@ __all__ = [
     "AgentConnection",
     "PeerInfo",
     "ProtocolMetrics",
+    "DirectAgentSocket",
+    "DirectAgentSocketServer",
     "PROTOCOL_VERSION",
     "MAX_FRAME_SIZE",
     "FRAME_HEADER_SIZE",
@@ -51,4 +82,20 @@ __all__ = [
     "MAX_SEQUENCE",
     "NonceRegistry",
     "NONCE_CACHE_MAX",
+    "DirectHandshakeInitiator",
+    "DirectHandshakeResponder",
+    "DirectHandshakeResult",
+    "ResumptionResponder",
+    "ResumeResult",
+    "build_resume",
+    "parse_resume",
+    "complete_resume",
+    "derive_resumption_secret",
+    "derive_resumed_session_key",
+    "issue_ticket",
+    "redeem_ticket",
+    "TicketClaims",
+    "DEFAULT_TICKET_TTL_SECONDS",
+    "PeerTrustStore",
+    "PinResult",
 ]

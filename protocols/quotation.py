@@ -16,8 +16,10 @@ Pricing model:
     - Verification depth: GOLD requires more compute
     - Region: some regions have harder anti-bot friction
 """
+import asyncio
 import logging
 import secrets
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -104,38 +106,85 @@ class QuotationEngine:
         "global": 1.3,
     }
 
+    # How often generate_quote() opportunistically purges expired quotes —
+    # not on every call (that'd be an O(n) scan per request), just periodically
+    _QUOTE_CLEANUP_INTERVAL_SECONDS = 60
+    # Cap on in-memory usage history — this is a live metering cache, not the
+    # audit trail (that's persisted to DB); an unbounded list here grows
+    # forever for the life of the process
+    _MAX_USAGE_HISTORY = 10_000
+
     def __init__(self) -> None:
         # agent_id -> credit balance
         self._balances: Dict[str, float] = {}
         # quote_id -> Quote
         self._quotes: Dict[str, Quote] = {}
-        # Usage history
-        self._usage: List[UsageRecord] = []
+        # Usage history — bounded, oldest evicted first
+        self._usage: deque = deque(maxlen=self._MAX_USAGE_HISTORY)
         self._stats = {
             "quotes_generated": 0,
             "quotes_accepted": 0,
             "total_credits_consumed": 0.0,
         }
+        self._last_quote_cleanup = datetime.utcnow()
 
-    def add_credits(self, agent_id: str, amount: float) -> float:
+    def _purge_expired_quotes(self) -> None:
         """
-        Adds credits to an agent's balance.
+        Evicts quotes past their TTL from the live dict. Without this, every
+        quote ever generated (accepted or not) stays in memory for the entire
+        life of the process — a guaranteed unbounded leak on any server that
+        handles /m2m/quote traffic continuously.
+        """
+        now = datetime.utcnow()
+        expired_ids = []
+        for qid, q in self._quotes.items():
+            try:
+                created = datetime.fromisoformat(q.created_at)
+                if (now - created).total_seconds() > q.quote_ttl_seconds:
+                    expired_ids.append(qid)
+            except ValueError:
+                expired_ids.append(qid)  # Unparsable timestamp — drop it too
+        for qid in expired_ids:
+            del self._quotes[qid]
+        if expired_ids:
+            logger.debug(f"Purged {len(expired_ids)} expired quotes")
+
+    async def add_credits(self, agent_id: str, amount: float) -> float:
+        """
+        Adds credits to an agent's balance. Persisted to DB so it survives
+        restarts and is shared across worker processes; the in-memory dict is
+        kept as a fallback for when the DB is unavailable.
+
+        Runs the (synchronous, psycopg2-backed) DB call in a worker thread via
+        asyncio.to_thread — every core.database call is blocking, and calling
+        one directly from an `async def` FastAPI handler stalls the entire
+        event loop for the DB round-trip, freezing every OTHER concurrent
+        request (unrelated agents included) for that duration.
 
         Returns: New balance
         """
-        if agent_id not in self._balances:
-            self._balances[agent_id] = 0.0
+        try:
+            from core.database import add_credit_balance
+            new_balance = await asyncio.to_thread(add_credit_balance, agent_id, amount)
+            self._balances[agent_id] = new_balance
+        except Exception as e:
+            logger.warning(f"CREDITS: DB persist failed ({e}), using in-memory only")
+            self._balances[agent_id] = self._balances.get(agent_id, 0.0) + amount
 
-        self._balances[agent_id] += amount
         logger.info(
             f"CREDITS: +{amount:.2f} for {agent_id}, "
             f"balance={self._balances[agent_id]:.2f}"
         )
         return self._balances[agent_id]
 
-    def get_balance(self, agent_id: str) -> float:
-        """Returns an agent's current credit balance."""
-        return self._balances.get(agent_id, 0.0)
+    async def get_balance(self, agent_id: str) -> float:
+        """Returns an agent's current credit balance (DB-backed, falls back to in-memory cache)."""
+        try:
+            from core.database import get_credit_balance
+            return await asyncio.to_thread(get_credit_balance, agent_id)
+        except Exception as e:
+            logger.warning(f"BALANCE: DB read failed ({e}), using in-memory cache")
+            return self._balances.get(agent_id, 0.0)
 
     def generate_quote(
         self,
@@ -152,6 +201,11 @@ class QuotationEngine:
             + attachment_count × ATTACHMENT_MULTIPLIER
             × region_difficulty
         """
+        now = datetime.utcnow()
+        if (now - self._last_quote_cleanup).total_seconds() > self._QUOTE_CLEANUP_INTERVAL_SECONDS:
+            self._purge_expired_quotes()
+            self._last_quote_cleanup = now
+
         # Base prices by service
         base_prices = {
             "svc-data-extraction": 5.0,
@@ -195,7 +249,7 @@ class QuotationEngine:
         )
         return quote
 
-    def accept_quote(self, quote_id: str) -> bool:
+    async def accept_quote(self, quote_id: str) -> bool:
         """
         Accepts a quote and deducts credits from the agent's balance.
 
@@ -221,17 +275,32 @@ class QuotationEngine:
         except ValueError:
             pass
 
-        # Check balance
-        balance = self.get_balance(quote.agent_id)
-        if balance < quote.estimated_credits:
+        # Check + deduct credits atomically. deduct_credit_balance() does the
+        # balance check and the deduction as a single conditional DB UPDATE
+        # (WHERE balance >= amount), so two concurrent accept_quote() calls —
+        # even across different worker processes — can't both pass a
+        # check-then-deduct race and double-spend the same balance. Run via
+        # asyncio.to_thread so this blocking DB round-trip doesn't stall the
+        # event loop for every other concurrent request.
+        try:
+            from core.database import deduct_credit_balance
+            deducted = await asyncio.to_thread(
+                deduct_credit_balance, quote.agent_id, quote.estimated_credits
+            )
+        except Exception as e:
+            logger.warning(f"ACCEPT: DB deduct failed ({e}), falling back to in-memory check")
+            balance = self._balances.get(quote.agent_id, 0.0)
+            deducted = balance >= quote.estimated_credits
+            if deducted:
+                self._balances[quote.agent_id] = balance - quote.estimated_credits
+
+        if not deducted:
             logger.warning(
-                f"Insufficient credits: {quote.agent_id} has "
-                f"{balance:.2f}, needs {quote.estimated_credits:.2f}"
+                f"Insufficient credits: {quote.agent_id} needs {quote.estimated_credits:.2f}"
             )
             return False
 
-        # Deduct credits
-        self._balances[quote.agent_id] -= quote.estimated_credits
+        self._balances[quote.agent_id] = await self.get_balance(quote.agent_id)
         quote.is_accepted = True
         self._stats["quotes_accepted"] += 1
         self._stats["total_credits_consumed"] += quote.estimated_credits

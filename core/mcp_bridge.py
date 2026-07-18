@@ -61,15 +61,6 @@ class MCPBridge:
                 "proof_hash": {"type": "string", "description": "Proof hash to verify"},
             },
         }
-        self.available_tools["submit_to_sandbox"] = {
-            "name": "submit_to_sandbox",
-            "provider": "registry-base",
-            "description": "Run attack simulations against an agent in the security sandbox.",
-            "parameters": {
-                "agent_id": {"type": "string", "description": "Agent to test"},
-                "attack_types": {"type": "array", "description": "Attack types to run (empty = all)", "default": []},
-            },
-        }
         self.available_tools["issue_agent_passport"] = {
             "name": "issue_agent_passport",
             "provider": "registry-base",
@@ -117,8 +108,6 @@ class MCPBridge:
             return await self._tool_lookup_trust(params)
         elif tool_name == "verify_proof":
             return await self._tool_verify_proof(params)
-        elif tool_name == "submit_to_sandbox":
-            return await self._tool_submit_to_sandbox(params)
         elif tool_name == "issue_agent_passport":
             return await self._tool_issue_passport(params)
         elif tool_name == "verify_agent_passport":
@@ -205,34 +194,6 @@ class MCPBridge:
                 "proof_hash": proof_hash,
                 "db_record": db_result or {},
                 "on_chain": chain_result or {"note": "Blockchain not connected"},
-            }
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-
-    async def _tool_submit_to_sandbox(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Runs attack simulations against an agent."""
-        try:
-            from core.attack_simulator import AttackSimulator
-            import uuid
-
-            simulator = AttackSimulator()
-            session_id = f"mcp-sess-{uuid.uuid4().hex[:8]}"
-            results = await simulator.run_attacks(
-                session_id=session_id,
-                agent_id=params.get("agent_id", "unknown"),
-                attack_types=params.get("attack_types", []),
-            )
-
-            total = len(results)
-            passed = sum(1 for r in results if r.get("passed", False))
-            return {
-                "status": "success",
-                "session_id": session_id,
-                "total_attacks": total,
-                "passed": passed,
-                "failed": total - passed,
-                "resilience_score": passed / total if total > 0 else 0.0,
-                "results": results,
             }
         except Exception as e:
             return {"status": "error", "message": str(e)}

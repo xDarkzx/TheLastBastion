@@ -50,6 +50,8 @@ docker-volumes/
 # Keys and secrets
 *.keys.json
 .bastion_keys.json
+scripts/.bench_*.json
+scripts/bastion_bench_report.json
 
 # Private files — never push
 CLAUDE.md
@@ -57,5 +59,13 @@ CLAUDE.md
 .gemini/
 .geminiignore
 deploy_to_pi.py
+
+# Local-only: adversarial self-test suite (removed from public repo + history
+# on 2026-07-19 — kept on disk for local dev/testing only, never re-tracked)
+core/attacks/
+core/attack_simulator.py
+sdk/examples/attack_test.py
+sdk/examples/challenge_me.py
+scripts/run_sandbox_test.py
 deploy-agents-to-pi.ps1
 data/

@@ -86,29 +86,49 @@ REMOTE_BASTION_PORTS = {
 REGISTRY_BASE_AGENTS = {
     "producer": {
         "m2m_id": "producer-regional-001",
-        "public_key": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
         "role": "DATA_PROVIDER",
         "capabilities": ["data_extraction", "batch_generation", "provenance"],
     },
     "compliance": {
         "m2m_id": "compliance-regional-001",
-        "public_key": "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3",
         "role": "VERIFIER",
         "capabilities": ["export_compliance", "certification", "regulation_check"],
     },
     "logistics": {
         "m2m_id": "logistics-maersk-001",
-        "public_key": "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
         "role": "DATA_PROVIDER",
         "capabilities": ["container_tracking", "cold_chain", "shipping"],
     },
     "buyer": {
         "m2m_id": "buyer-sg-001",
-        "public_key": "d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5",
         "role": "DATA_CONSUMER",
         "capabilities": ["purchase_verification", "cross_document_audit", "payment"],
     },
 }
+
+# Real, persistent per-agent Ed25519 identities — NOT the shared issuer key.
+# Each agent gets its own keypair, saved under .agent_keys/ on first use, so
+# the same agent presents the same public key across restarts instead of a
+# fresh throwaway key (or the issuer's own key) every run.
+#
+# Anchored to the project root, not the process's CWD — a bare relative path
+# would silently regenerate a "persistent" identity every time this is
+# launched from a different working directory.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_agent_keys_cache: Dict[str, tuple] = {}
+
+
+def _get_agent_keypair(name: str) -> tuple:
+    """Lazily loads (or creates) this agent's persistent Ed25519 keypair."""
+    if name not in _agent_keys_cache:
+        from lastbastion.crypto import load_or_create_keypair
+        path = os.path.join(_PROJECT_ROOT, ".agent_keys", f"{name}.keys.json")
+        _agent_keys_cache[name] = load_or_create_keypair(path)
+    return _agent_keys_cache[name]
+
+
+def _get_agent_public_key(name: str) -> str:
+    return _get_agent_keypair(name)[0]
 
 
 # ───────────────────────────────────────────────────────────────
@@ -481,7 +501,7 @@ class AgentNetwork:
             try:
                 resp = await client.post(f"{self.registry_base_url}/m2m/register", json={
                     "agent_id": m2m_id,
-                    "public_key": swarm_cfg.get("public_key", ""),
+                    "public_key": _get_agent_public_key(name),
                     "role": swarm_cfg.get("role", "DATA_PROVIDER"),
                     "display_name": card["name"],
                     "capabilities": swarm_cfg.get("capabilities", []),
@@ -552,7 +572,7 @@ class AgentNetwork:
                     "agent_id": m2m_id,
                     "agent_name": card["name"],
                     "agent_url": card["url"],
-                    "public_key": swarm_cfg.get("public_key", ""),
+                    "public_key": _get_agent_public_key(name),
                     "capabilities": swarm_cfg.get("capabilities", []),
                     "metadata": {
                         "role": swarm_cfg.get("role", ""),
@@ -1084,7 +1104,7 @@ class AgentNetwork:
     async def _boot_bastion_servers(self):
         """Start Bastion Protocol TCP servers for each agent."""
         try:
-            from lastbastion.crypto import generate_keypair
+            from lastbastion.crypto import load_or_create_issuer_keypair
             from lastbastion.passport import AgentPassport
             from lastbastion.protocol import AgentSocket, FrameType
             from core.bastion_bus import bastion_bus
@@ -1095,32 +1115,11 @@ class AgentNetwork:
         is_remote = self._bastion_host != "localhost"
         logger.info(f"BASTION: booting binary protocol {'(remote: ' + self._bastion_host + ')' if is_remote else 'servers'}...")
 
-        # Try to load issuer keys from file (shared with remote agent runner)
-        import json as _json
+        # Issuer keypair — env vars first, then the shared local file. Uses the
+        # same resolution as border_agent.py and agent_runner_bastion.py so all
+        # three agree on one issuer identity across processes and restarts.
         keys_file = os.path.join(os.path.dirname(__file__), "..", ".bastion_keys.json")
-        issuer_pub = os.environ.get("BASTION_ISSUER_PUB", "")
-        issuer_priv = os.environ.get("BASTION_ISSUER_PRIV", "")
-
-        if not issuer_pub or not issuer_priv:
-            try:
-                with open(keys_file) as f:
-                    kd = _json.load(f)
-                    issuer_pub = kd["issuer_pub"]
-                    issuer_priv = kd["issuer_priv"]
-                    logger.info(f"BASTION: loaded issuer keys from {keys_file}")
-            except Exception:
-                pass
-
-        if not issuer_pub or not issuer_priv:
-            issuer_pub, issuer_priv = generate_keypair()
-            logger.info(f"BASTION: generated new issuer keypair")
-            # Save for sharing
-            try:
-                with open(keys_file, "w") as f:
-                    _json.dump({"issuer_pub": issuer_pub, "issuer_priv": issuer_priv}, f)
-            except Exception:
-                pass
-
+        issuer_pub, issuer_priv = load_or_create_issuer_keypair(keys_file)
         self._issuer_keys = (issuer_pub, issuer_priv)
 
         # If remote, don't start local servers — just set up passports and keys
@@ -1131,7 +1130,7 @@ class AgentNetwork:
                 passport = AgentPassport(
                     agent_id=REGISTRY_BASE_AGENTS[name]["m2m_id"],
                     agent_name=name.title() + "Bot",
-                    public_key=issuer_pub,
+                    public_key=_get_agent_public_key(name),
                     trust_score=0.92,
                     trust_level="VERIFIED",
                     verdict="TRUSTED",
@@ -1159,9 +1158,18 @@ class AgentNetwork:
 
         for name, port in BASTION_PORTS.items():
             try:
-                # All agents use issuer keypair for JWT signing/verification
-                # This lets any agent verify any other agent's passport JWT
-                pub, priv = issuer_pub, issuer_priv
+                # Each agent has its OWN persistent public key as its identity.
+                # `signing_key` still has to be the issuer's private key because
+                # the SDK's build_hello()/build_hello_ack() re-signs the passport
+                # envelope on every handshake using whatever key is passed in —
+                # there's no "present an already issuer-signed passport" path yet.
+                # That means every agent here holds a copy of the issuer's
+                # private key, which is fine for a trusted demo swarm but is NOT
+                # how a real multi-tenant deployment should work (see follow-up:
+                # passports should be issued once, server-side, and presented
+                # pre-signed rather than re-signed by whoever's connecting).
+                pub = _get_agent_public_key(name)
+                priv = issuer_priv
                 self._bastion_keys[name] = (priv, pub)
 
                 passport = AgentPassport(

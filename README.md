@@ -2,6 +2,11 @@
 
 **Agent security infrastructure for a world where AI agents operate autonomously.**
 
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+[![Status: Prototype](https://img.shields.io/badge/status-prototype-orange.svg)](#whats-built)
+[![Protocol: Ed25519](https://img.shields.io/badge/crypto-Ed25519%20%2F%20X25519-informational.svg)](sdk/lastbastion/protocol/)
+
 Nobody is verifying the agents. The Last Bastion does.
 
 ---
@@ -54,68 +59,99 @@ Data arrives → Schema Gatekeeper (injection detection, type checking)
 
 Every verification produces a tamper-evident proof record. These chain together in a Merkle chain — modify any record and all subsequent hashes break. Optionally anchored on-chain for independent verification.
 
-### Open Sandbox
+### Bastion Protocol — the fast lane for agent-to-agent traffic
 
-Send your agent to be tested. The sandbox runs simulated attacks against it:
-- Prompt injection
-- Identity spoofing
-- Sybil flooding
-- Data exfiltration attempts
-- Payload poisoning
-- Replay attacks
+Most agent frameworks talk JSON-RPC over HTTP. That's the right choice for *discovery* — it's an open standard, and it's how an agent you've never met (built on someone else's stack) can find and talk to you at all. But once two agents both support this protocol, JSON-RPC is pure overhead: text serialization, no session encryption by default, a full connection setup on every call.
 
-Your agent gets a trust score based on what it survives.
+Bastion Protocol is a binary wire protocol for that second case — MessagePack framing, Ed25519 identity, X25519 ephemeral Diffie-Hellman handshakes (forward secrecy), NaCl SecretBox-encrypted sessions, and TLS-1.3-style session resumption so a reconnect doesn't pay the full handshake cost again. Two authentication modes, chosen per deployment, not per protocol:
+
+- **PASSPORT mode** — an issuer-signed passport, pinned to a known trust authority. Use this when a verification authority (like The Last Bastion) is in the loop.
+- **DIRECT mode** — no issuer required. Two agents that already hold their own Ed25519 keys authenticate each other via key pinning (the same trust-on-first-use model SSH uses for host keys) — for the common real-world case where no third-party authority exists yet, but you still want a fast, encrypted, mutually authenticated channel.
+
+A2A stays the front door for the open ecosystem. Bastion Protocol is what agents that have already met each other switch to.
+
+### Sandbox
+
+A multi-tenant test environment: register an organization, get a sandbox API key, start a session for your agent, submit payloads through the same verification pipeline described above, and track trust score history over time.
+
+---
+
+## Prove it yourself
+
+We don't ask you to take performance claims on faith — we ship the tool that measures them.
+
+```bash
+# Terminal 1 — the receiving agent
+python scripts/bastion_bench.py serve --port 9100
+
+# Terminal 2 — the sending agent (same machine, or point --host at a different one entirely)
+python scripts/bastion_bench.py bench --host 127.0.0.1 --port 9100
+```
+
+This spins up two real agents that perform a real handshake and exchange real encrypted frames over a real TCP connection — no mocks, no simulated numbers. It reports, from that run:
+
+- Fresh handshake latency vs. resumed handshake latency (session resumption skips the full key exchange)
+- Throughput (messages/sec, MB/sec) and round-trip latency percentiles
+- CPU/memory usage during the run
+- A side-by-side comparison against plain JSON-over-TCP on the same machine, same payload, same run
+
+The tool needs zero external infrastructure — no Postgres, no Redis, no Docker. Just this repo's SDK.
+
+We're not going to print a number here and ask you to trust it. Run it, on your own hardware, on your own network. If the numbers don't hold up, that's useful information for us too — [see the open items below](#whats-built).
 
 ---
 
 ## Architecture
 
 ```
-                         ┌─────────────────────────────────┐
-                         │       THE LAST BASTION           │
-                         │                                  │
-  Agent arrives ────────►│  M2M Protocol (Ed25519 + Nonce)  │
-                         │         │                        │
-                         │    ┌────▼────┐                   │
-                         │    │  Agent   │  10-check trust   │
-                         │    │ Verifier │  pipeline          │
-                         │    └────┬────┘                   │
-                         │         │                        │
-                         │    ┌────▼────┐                   │
-                         │    │ Passport │  Ed25519-signed   │
-                         │    │ Issuer   │  JWT + blockchain  │
-                         │    └────┬────┘                   │
-                         │         │                        │
-  Data arrives ─────────►│  ┌──────▼──────┐                 │
-                         │  │  5-Layer     │                 │
-                         │  │ Verification │                 │
-                         │  │  Pipeline    │                 │
-                         │  └──────┬──────┘                 │
-                         │         │                        │
-                         │    ┌────▼────┐                   │
-                         │    │  Proof   │  Merkle chain     │
-                         │    │  Ledger  │  + blockchain     │
-                         │    └─────────┘                   │
-                         │                                  │
-                         │    ┌─────────┐                   │
-  Sandbox test ─────────►│   │ Attack   │  6 attack types   │
-                         │    │Simulator│  simulated execution   │
-                         │    └─────────┘                   │
-                         └─────────────────────────────────┘
+                         ┌───────────────────────────────────┐
+                         │         THE LAST BASTION           │
+                         │                                    │
+  Agent arrives ────────►│  M2M / REST API (Ed25519 + Nonce)  │
+                         │            │                       │
+                         │       ┌────▼─────┐                 │
+                         │       │  Agent   │  10-check trust  │
+                         │       │ Verifier │  pipeline        │
+                         │       └────┬─────┘                 │
+                         │            │                       │
+                         │       ┌────▼─────┐                 │
+                         │       │ Passport │  Ed25519-signed  │
+                         │       │ Issuer   │  JWT + blockchain│
+                         │       └────┬─────┘                 │
+                         │            │                       │
+  Data arrives ─────────►│      ┌─────▼──────┐                │
+                         │      │  5-Layer   │                │
+                         │      │Verification│                │
+                         │      │  Pipeline  │                │
+                         │      └─────┬──────┘                │
+                         │            │                       │
+                         │       ┌────▼─────┐                 │
+                         │       │  Proof   │  Merkle chain    │
+                         │       │  Ledger  │  + blockchain    │
+                         │       └──────────┘                 │
+                         └───────────────────────────────────┘
+                                       ▲
+                                       │  binary, encrypted, resumable
+                         ┌─────────────┴─────────────┐
+                         │      Bastion Protocol       │
+                         │  PASSPORT mode / DIRECT mode│
+                         └─────────────────────────────┘
+                            ▲                       ▲
+                    Agent A (your stack)     Agent B (their stack)
 ```
 
 ---
 
 ## What's Built
 
-Everything listed below is implemented as a working prototype.
+Everything listed below is implemented and covered by an automated test suite. Nothing here is marketing copy for a roadmap item — if it's listed as built, `pytest` proves it on every change.
 
 ### Security Infrastructure
 - **10-check agent verification pipeline** — identity, crypto challenge, behavioral, anti-Sybil, payload, network, history, anomaly
 - **Ed25519 challenge-response authentication** — agents prove key ownership, not just key possession
 - **Cryptographic passports** — signed JWTs with anti-cloning protection (runtime fingerprint, IP allowlist hash)
 - **M2M protocol** — message freshness (300s window), nonce anti-replay, rate limiting, RBAC
-- **6-attack sandbox** — prompt injection, identity spoofing, Sybil flood, exfiltration, payload poisoning, replay
+- **Bastion Protocol** — binary agent-to-agent wire protocol; PASSPORT mode (issuer-verified) and DIRECT mode (key-pinned, no issuer needed); session resumption with single-use rotating tickets and forward secrecy
 
 ### Verification Stack
 - **Schema Gatekeeper** — structural validation, SQL/XSS/code injection detection
@@ -132,15 +168,22 @@ Everything listed below is implemented as a working prototype.
   - `SwarmAgentRegistry` — agent identity, reputation, service marketplace ([0xc917...0D7D](https://amoy.polygonscan.com/address/0xc9177baBF86FF16794AABd1a2169f898986a0D7D))
 
 ### Agent Network
-- **A2A Protocol** (Linux Foundation standard) — agent-to-agent communication
+- **A2A Protocol** (Linux Foundation standard) — the outward-facing discovery layer, for agents outside this ecosystem
+- **Bastion Protocol** — the fast inner lane once both sides can speak it (see above)
 - **4 demo agents** — Producer, Compliance, Logistics, Buyer — demonstrating a supply chain verification workflow
-- **Agent Cards** — standardised discovery (/.well-known/agent.json)
+- **Agent Cards** — standardised discovery (`/.well-known/agent-card.json`)
 
 ### Platform
 - **FastAPI backend** with full API docs at `/docs`
 - **React dashboard** — monitoring, protocol feed, sandbox controls
-- **Python SDK** — client, gateway middleware, MCP tools
-- **Docker orchestration** — 4 services, one command to start
+- **Python SDK** — client, gateway middleware, protocol library, MCP tools
+- **Docker orchestration** — one command to start
+
+### Known open items
+We'd rather list what's still rough than have you find out the hard way:
+- Bastion Protocol's DATA-frame throughput is currently *not yet* faster than plain JSON-over-TCP for small, high-frequency messages on the same machine — session resumption shows a real, measured speedup, but raw throughput has more optimization ahead. Run the bench tool above for current numbers.
+- Most of `core/database.py`'s query layer is still synchronous, which can block the event loop under concurrent load on a handful of older endpoints — being worked through incrementally.
+- DIRECT mode + session resumption are implemented and tested at the protocol layer but not yet wired into the high-level `AgentSocket` convenience API — usable today via `DirectAgentSocket` directly.
 
 ---
 
@@ -151,7 +194,7 @@ Everything listed below is implemented as a working prototype.
 ```bash
 # 1. Clone
 git clone https://github.com/xDarkzx/TheLastBastion.git
-cd the-last-bastion
+cd TheLastBastion
 
 # 2. Configure
 cp .env.example .env
@@ -167,6 +210,8 @@ docker-compose up --build
 | **API** | [http://localhost:8000](http://localhost:8000) |
 | **API Docs** | [http://localhost:8000/docs](http://localhost:8000/docs) |
 
+Just want to see two agents talk to each other, no Docker required? See [Prove it yourself](#prove-it-yourself) above.
+
 Full setup guide with troubleshooting: **[SETUP.md](SETUP.md)**
 
 ---
@@ -178,10 +223,11 @@ Full setup guide with troubleshooting: **[SETUP.md](SETUP.md)**
 | **API** | FastAPI, Uvicorn, SQLAlchemy |
 | **Database** | PostgreSQL (persistent), Redis (queuing + pub/sub) |
 | **Frontend** | React, Vite, Axios |
-| **Cryptography** | Ed25519 (PyNaCl), SHA-256, HMAC, JWT |
+| **Cryptography** | Ed25519, X25519 (PyNaCl / libsodium), SHA-256, HMAC, JWT |
+| **Serialization** | MessagePack (Bastion Protocol), JSON (REST/A2A) |
 | **Blockchain** | Solidity, Hardhat, Web3.py, Polygon Amoy |
 | **LLM** | Groq (Llama 3.3 70B), Ollama (local, optional) |
-| **Agent Protocol** | A2A (Linux Foundation), MCP |
+| **Agent Protocol** | A2A (Linux Foundation), Bastion Protocol (this repo), MCP |
 | **Containerisation** | Docker, Docker Compose |
 | **Forensics** | PIL/Pillow, NumPy (ELA, noise, copy-move, lighting) |
 
@@ -209,7 +255,7 @@ On-chain agent identity, reputation scores (0-100), service listings, and task r
 
 ## SDK
 
-The Python SDK lets any agent interact with The Last Bastion — register, get verified, submit data, protect endpoints.
+The Python SDK lets any agent interact with The Last Bastion — register, get verified, submit data, protect endpoints, or speak Bastion Protocol directly.
 
 ```python
 from lastbastion import LastBastionClient
@@ -229,6 +275,23 @@ async with LastBastionClient(base_url="http://localhost:8000") as client:
     # Submit data for verification
     result = await client.submit_payload({"invoice": {"total": 1500}})
     # result = {"verdict": "VERIFIED", "score": 0.82, "proof_hash": "abc123..."}
+```
+
+Talking directly to another agent over Bastion Protocol, no verification authority required:
+
+```python
+from lastbastion.crypto import generate_keypair
+from lastbastion.protocol import DirectAgentSocket, PeerTrustStore
+
+pub, priv = generate_keypair()
+trust_store = PeerTrustStore(".my_agent_trust.json")
+
+conn, ticket, secret = await DirectAgentSocket.connect(
+    "peer-host:9100", agent_id="my-agent", public_key=pub,
+    signing_key=priv, trust_store=trust_store,
+)
+await conn.send({"task": "verify", "payload": {...}})
+result = await conn.recv()
 ```
 
 Full SDK documentation: **[sdk/README.md](sdk/README.md)**
@@ -266,10 +329,11 @@ The security model is grounded in real research:
 - [MCP Protocol](https://modelcontextprotocol.io/) — Tool integration standard
 
 Architecture documents in [`/documents`](documents/):
-- `BASTION_PROTOCOL_SPEC.md` — Protocol specification
+- `BASTION_PROTOCOL_SPEC.md` — Bastion Protocol specification
+- `SYSTEM_ARCHITECTURE.md` — Full system design
 - `SANDBOX_BLUEPRINT.md` — Sandbox architecture
 - `NIST_RESEARCH.md` — NIST gap analysis
-- `SYSTEM_ARCHITECTURE.md` — Full system design
+- `M2M_SIMULATION_BLUEPRINT.md` — M2M simulation ecosystem design
 
 ---
 
@@ -289,4 +353,4 @@ Email: [dkstudiosnz@gmail.com](mailto:dkstudiosnz@gmail.com)
 
 ---
 
-*i am solo dev Solving security problems the rest of the industry hasn't noticed yet.*
+*Solo developer. Building the security layer the rest of the agent ecosystem hasn't gotten to yet — one verified commit at a time.*

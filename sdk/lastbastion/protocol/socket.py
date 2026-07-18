@@ -51,12 +51,32 @@ from lastbastion.protocol.handshake import (
     HandshakeResponder,
     HandshakeResult,
     SessionKeys,
+    DirectHandshakeInitiator,
+    DirectHandshakeResponder,
+    ResumptionResponder,
+    build_resume,
+    complete_resume,
 )
 
 logger = logging.getLogger("BASTION_SOCKET")
 
 # Default max stream size: 256MB
 DEFAULT_MAX_STREAM_SIZE = 256 * 1024 * 1024
+
+
+def _resolve_host(host: str) -> str:
+    """
+    Rewrites the literal string "localhost" to "127.0.0.1".
+
+    On Windows (and some other dual-stack configurations), resolving
+    "localhost" through asyncio.open_connection() can take ~2 SECONDS before
+    falling back from a slow/blocked IPv6 (::1) attempt to IPv4 -- measured
+    directly: 2033ms for "localhost" vs 3ms for "127.0.0.1" on the same
+    machine, same process, same everything else. That's not protocol cost,
+    it's hostname resolution, and it's large enough to completely swamp any
+    real handshake-latency measurement. Any other hostname/IP is left as-is.
+    """
+    return "127.0.0.1" if host == "localhost" else host
 
 
 # ---------------------------------------------------------------------------
@@ -341,24 +361,38 @@ class AgentConnection:
         async with self._recv_lock:
             return await self._read_frame_raw()
 
+    async def _read_length_and_body(self) -> bytes:
+        """Reads the 4-byte length prefix then the frame body. No timeout of
+        its own -- the caller wraps this whole thing in one asyncio.wait_for."""
+        length_bytes = await self._reader.readexactly(4)
+        frame_length = int.from_bytes(length_bytes, "big")
+
+        if frame_length > MAX_FRAME_SIZE + FRAME_HEADER_SIZE + SIGNATURE_SIZE:
+            raise ConnectionError(f"Frame too large: {frame_length}")
+
+        return await self._reader.readexactly(frame_length)
+
     async def _read_frame_raw(self) -> BastionFrame:
-        """Read a frame from the wire (no lock -- internal use)."""
+        """
+        Read a frame from the wire (no lock -- internal use).
+
+        Both reads (length prefix + body) share ONE asyncio.wait_for instead
+        of one each -- wait_for isn't free (measured ~20us of task/timer
+        setup overhead per call on top of the read itself), and calling it
+        twice per frame, on both ends of every round trip, was a real,
+        measured contributor to DATA-frame latency. Using the more generous
+        of the two original timeouts (FRAME_TIMEOUT_SECONDS +
+        PING_INTERVAL_SECONDS) for the combined operation is strictly more
+        permissive than before, not less -- it can't newly time out a read
+        that would previously have succeeded, only continues to catch a
+        genuinely stalled connection.
+        """
         try:
-            # Read length prefix
-            length_bytes = await asyncio.wait_for(
-                self._reader.readexactly(4),
+            frame_data = await asyncio.wait_for(
+                self._read_length_and_body(),
                 timeout=FRAME_TIMEOUT_SECONDS + PING_INTERVAL_SECONDS,
             )
-            frame_length = int.from_bytes(length_bytes, "big")
-
-            if frame_length > MAX_FRAME_SIZE + FRAME_HEADER_SIZE + SIGNATURE_SIZE:
-                raise ConnectionError(f"Frame too large: {frame_length}")
-
-            # Read frame data with strict timeout
-            frame_data = await asyncio.wait_for(
-                self._reader.readexactly(frame_length),
-                timeout=FRAME_TIMEOUT_SECONDS,
-            )
+            frame_length = len(frame_data)
         except asyncio.TimeoutError:
             self._closed = True
             raise ConnectionError("Frame timeout -- incomplete frame received")
@@ -425,7 +459,7 @@ class AgentSocket:
             host = parts[0]
             port = int(parts[1])
 
-        reader, writer = await asyncio.open_connection(host, port)
+        reader, writer = await asyncio.open_connection(_resolve_host(host), port)
 
         try:
             # Perform handshake
@@ -695,3 +729,447 @@ class AgentSocketServer:
                     await conn.close()
                 except Exception:
                     pass
+
+
+# ---------------------------------------------------------------------------
+# DirectAgentSocket -- DIRECT mode (no passport office) + session resumption
+# ---------------------------------------------------------------------------
+#
+# Same developer-facing shape as AgentSocket, but:
+#   - authentication is key-pinning (PeerTrustStore) instead of an
+#     issuer-signed passport (see handshake.py's DIRECT mode section)
+#   - session resumption is automatic when a ticket is supplied to connect():
+#     resumption is attempted first, and on any rejection (expired/replayed/
+#     unknown ticket) this transparently reconnects and falls back to a fresh
+#     DIRECT handshake -- callers never need to handle that fallback manually
+#
+# Deliberately does NOT touch AgentConnection or the existing PASSPORT-mode
+# AgentSocket/AgentSocketServer above -- those stay exactly as they were.
+
+class DirectAgentSocket:
+    """
+    Agent-to-agent communication socket for DIRECT mode.
+
+    Client:
+        conn, ticket, secret = await DirectAgentSocket.connect(
+            "host:port", agent_id="my-agent", public_key=pub, signing_key=priv,
+            trust_store=store,
+        )
+        # store (ticket, secret) somewhere; next time, pass them back in to
+        # skip the full handshake:
+        conn, ticket, secret = await DirectAgentSocket.connect(
+            "host:port", agent_id="my-agent", public_key=pub, signing_key=priv,
+            trust_store=store, resume_ticket=ticket, resumption_secret=secret,
+        )
+
+    Server:
+        server = DirectAgentSocket.listen(
+            port=9100, agent_id="my-agent", public_key=pub, signing_key=priv,
+            trust_store=store, ticket_key=ticket_key,  # omit ticket_key to disable resumption
+        )
+        server.on_connect(handle)
+        await server.start()
+    """
+
+    @staticmethod
+    async def connect(
+        host: str,
+        agent_id: str,
+        public_key: str,
+        signing_key: str,
+        trust_store,
+        port: int = 9100,
+        tofu: bool = True,
+        resume_ticket: Optional[bytes] = None,
+        resumption_secret: Optional[bytes] = None,
+        max_stream_size: int = DEFAULT_MAX_STREAM_SIZE,
+        on_frame_sent: Optional[Callable] = None,
+        on_frame_received: Optional[Callable] = None,
+    ):
+        """
+        Connect using DIRECT mode.
+
+        If resume_ticket AND resumption_secret are both provided, attempts
+        session resumption first (skips the full X25519 handshake). On
+        rejection (ticket expired/already used/unknown to this server), this
+        automatically reconnects fresh with a full DIRECT handshake instead
+        -- callers don't need to implement that fallback themselves.
+
+        Returns (connection, next_ticket, resumption_secret).
+        next_ticket is None if the server isn't configured for resumption
+        (no ticket_key). resumption_secret does NOT change across a ticket's
+        rotation lineage -- store both alongside each other and pass the
+        latest ticket back in on the next connect() call.
+        """
+        if ":" in host:
+            parts = host.rsplit(":", 1)
+            host = parts[0]
+            port = int(parts[1])
+        host = _resolve_host(host)
+
+        if resume_ticket is not None and resumption_secret is not None:
+            try:
+                return await DirectAgentSocket._connect_resume(
+                    host, port, signing_key, resume_ticket, resumption_secret,
+                    max_stream_size, on_frame_sent, on_frame_received,
+                )
+            except (ValueError, ConnectionError, OSError) as e:
+                logger.info(f"Resumption failed ({e}), falling back to fresh DIRECT handshake")
+
+        return await DirectAgentSocket._connect_fresh(
+            host, port, agent_id, public_key, signing_key, trust_store, tofu,
+            max_stream_size, on_frame_sent, on_frame_received,
+        )
+
+    @staticmethod
+    async def _connect_fresh(
+        host, port, agent_id, public_key, signing_key, trust_store, tofu,
+        max_stream_size, on_frame_sent, on_frame_received,
+    ):
+        reader, writer = await asyncio.open_connection(host, port)
+        try:
+            initiator = DirectHandshakeInitiator(agent_id, public_key, signing_key, trust_store)
+            hello_frame = initiator.build_hello()
+            frame_bytes = hello_frame.to_bytes()
+            writer.write(len(frame_bytes).to_bytes(4, "big") + frame_bytes)
+            await writer.drain()
+
+            length_bytes = await asyncio.wait_for(
+                reader.readexactly(4), timeout=FRAME_TIMEOUT_SECONDS
+            )
+            ack_length = int.from_bytes(length_bytes, "big")
+            ack_data = await asyncio.wait_for(
+                reader.readexactly(ack_length), timeout=FRAME_TIMEOUT_SECONDS
+            )
+            ack_frame = BastionFrame.from_bytes(ack_data)
+
+            if ack_frame.msg_type == FrameType.ERROR:
+                error_data = deserialize_payload(ack_frame.payload)
+                raise ValueError(f"HELLO rejected: {error_data.get('message', 'unknown')}")
+
+            result = initiator.complete(ack_frame, tofu=tofu)
+            result.finalize()
+
+            passport_hash = compute_passport_hash(agent_id)
+            # sign_data_frames=False: post-handshake authenticity comes from
+            # NaCl SecretBox's authenticated encryption, not a per-frame
+            # Ed25519 signature the receiver never verifies anyway (verify_key
+            # is empty below) -- signing for real here was pure wasted crypto
+            # work, measured as the dominant cost in DATA-frame throughput.
+            encoder = FrameEncoder(passport_hash, signing_key, sign_data_frames=False)
+            decoder = FrameDecoder(b"", "")
+            decoder._handshake_complete = True
+
+            peer = PeerInfo(
+                agent_id=result.peer_agent_id,
+                agent_name=result.peer_agent_id,
+                trust_level="DIRECT",
+                verdict="DIRECT_NEW" if result.trust_pin.is_new else "DIRECT_PINNED",
+            )
+
+            local_passport = AgentPassport(agent_id=agent_id, public_key=public_key)
+            conn = AgentConnection(
+                reader=reader,
+                writer=writer,
+                encoder=encoder,
+                decoder=decoder,
+                session_keys=result.session_keys,
+                peer=peer,
+                local_passport=local_passport,
+                max_stream_size=max_stream_size,
+                on_frame_sent=on_frame_sent,
+                on_frame_received=on_frame_received,
+            )
+            conn.start_keepalive()
+            return conn, result.session_ticket, result.resumption_secret
+
+        except Exception:
+            writer.close()
+            raise
+
+    @staticmethod
+    async def _connect_resume(
+        host, port, signing_key, ticket, resumption_secret,
+        max_stream_size, on_frame_sent, on_frame_received,
+    ):
+        import os as _os
+
+        reader, writer = await asyncio.open_connection(host, port)
+        try:
+            client_nonce = _os.urandom(32)
+            resume_frame = build_resume(ticket, client_nonce)
+            frame_bytes = resume_frame.to_bytes()
+            writer.write(len(frame_bytes).to_bytes(4, "big") + frame_bytes)
+            await writer.drain()
+
+            length_bytes = await asyncio.wait_for(
+                reader.readexactly(4), timeout=FRAME_TIMEOUT_SECONDS
+            )
+            resp_length = int.from_bytes(length_bytes, "big")
+            resp_data = await asyncio.wait_for(
+                reader.readexactly(resp_length), timeout=FRAME_TIMEOUT_SECONDS
+            )
+            resp_frame = BastionFrame.from_bytes(resp_data)
+
+            if resp_frame.msg_type == FrameType.ERROR:
+                error_data = deserialize_payload(resp_frame.payload)
+                raise ValueError(f"Resume rejected: {error_data.get('message', 'unknown')}")
+
+            session_keys, next_ticket = complete_resume(resp_frame, client_nonce, resumption_secret)
+
+            # RESUME_ACK carries only server_nonce + next_ticket, not the
+            # peer's agent_id -- the caller already knows who they resumed
+            # with (they supplied a ticket scoped to that specific peer).
+            peer = PeerInfo(trust_level="DIRECT", verdict="RESUMED")
+
+            encoder = FrameEncoder(b"\x00" * PASSPORT_HASH_SIZE, signing_key, sign_data_frames=False)
+            decoder = FrameDecoder(b"", "")
+            decoder._handshake_complete = True
+
+            conn = AgentConnection(
+                reader=reader,
+                writer=writer,
+                encoder=encoder,
+                decoder=decoder,
+                session_keys=session_keys,
+                peer=peer,
+                local_passport=None,
+                max_stream_size=max_stream_size,
+                on_frame_sent=on_frame_sent,
+                on_frame_received=on_frame_received,
+            )
+            conn.start_keepalive()
+            return conn, next_ticket, resumption_secret
+
+        except Exception:
+            writer.close()
+            raise
+
+    @staticmethod
+    def listen(
+        agent_id: str,
+        public_key: str,
+        signing_key: str,
+        trust_store,
+        host: str = "0.0.0.0",
+        port: int = 9100,
+        tofu: bool = True,
+        ticket_key: Optional[bytes] = None,
+        revocation_check: Optional[Callable] = None,
+        max_stream_size: int = DEFAULT_MAX_STREAM_SIZE,
+        on_frame_sent: Optional[Callable] = None,
+        on_frame_received: Optional[Callable] = None,
+    ) -> "DirectAgentSocketServer":
+        """
+        Create a server that accepts incoming DIRECT-mode connections.
+
+        ticket_key: omit to run without resumption support (every connection
+        does a full handshake). Pass one (crypto.load_or_create_symmetric_key)
+        to let peers resume sessions.
+        revocation_check: optional callable(agent_id) -> bool, forwarded to
+        the ResumptionResponder used for resumed connections (see handshake.py
+        -- resumed sessions skip full re-verification by design, so wire this
+        if a revoked agent must be locked out before its tickets naturally expire).
+        """
+        return DirectAgentSocketServer(
+            agent_id=agent_id,
+            public_key=public_key,
+            signing_key=signing_key,
+            trust_store=trust_store,
+            host=host,
+            port=port,
+            tofu=tofu,
+            ticket_key=ticket_key,
+            revocation_check=revocation_check,
+            max_stream_size=max_stream_size,
+            on_frame_sent=on_frame_sent,
+            on_frame_received=on_frame_received,
+        )
+
+
+class DirectAgentSocketServer:
+    """Server that listens for incoming DIRECT-mode Bastion Protocol connections."""
+
+    def __init__(
+        self,
+        agent_id: str,
+        public_key: str,
+        signing_key: str,
+        trust_store,
+        host: str = "0.0.0.0",
+        port: int = 9100,
+        tofu: bool = True,
+        ticket_key: Optional[bytes] = None,
+        revocation_check: Optional[Callable] = None,
+        max_stream_size: int = DEFAULT_MAX_STREAM_SIZE,
+        on_frame_sent: Optional[Callable] = None,
+        on_frame_received: Optional[Callable] = None,
+    ):
+        self.agent_id = agent_id
+        self.public_key = public_key
+        self.signing_key = signing_key
+        self.trust_store = trust_store
+        self.host = host
+        self.port = port
+        self.tofu = tofu
+        self.ticket_key = ticket_key
+        self.revocation_check = revocation_check
+        self._max_stream_size = max_stream_size
+        self._handler = None
+        self._server = None
+        self._connections: List[AgentConnection] = []
+        self._on_frame_sent = on_frame_sent
+        self._on_frame_received = on_frame_received
+        self._resumption_responder = (
+            ResumptionResponder(ticket_key, revocation_check=revocation_check)
+            if ticket_key is not None else None
+        )
+
+    def on_connect(self, handler: Callable[[AgentConnection], Coroutine]):
+        self._handler = handler
+
+    @property
+    def active_connections(self) -> int:
+        return sum(1 for c in self._connections if not c.is_closed)
+
+    async def start(self):
+        if not self._handler:
+            raise RuntimeError("No handler registered -- call .on_connect() first")
+        self._server = await asyncio.start_server(self._handle_client, self.host, self.port)
+        logger.info(f"Bastion Protocol (DIRECT) server listening on {self.host}:{self.port}")
+        async with self._server:
+            await self._server.serve_forever()
+
+    async def start_background(self):
+        if not self._handler:
+            raise RuntimeError("No handler registered -- call .on_connect() first")
+        self._server = await asyncio.start_server(self._handle_client, self.host, self.port)
+        logger.info(f"Bastion Protocol (DIRECT) server listening on {self.host}:{self.port}")
+
+    async def stop(self):
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+        for conn in self._connections:
+            await conn.close()
+        self._connections.clear()
+
+    def _cleanup_closed(self):
+        self._connections = [c for c in self._connections if not c.is_closed]
+
+    async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        conn = None
+        try:
+            self._cleanup_closed()
+
+            length_bytes = await asyncio.wait_for(reader.readexactly(4), timeout=FRAME_TIMEOUT_SECONDS)
+            first_length = int.from_bytes(length_bytes, "big")
+            first_data = await asyncio.wait_for(reader.readexactly(first_length), timeout=FRAME_TIMEOUT_SECONDS)
+            first_frame = BastionFrame.from_bytes(first_data)
+
+            if first_frame.msg_type == FrameType.RESUME:
+                conn = await self._handle_resume(reader, writer, first_frame)
+            elif first_frame.msg_type == FrameType.HELLO:
+                conn = await self._handle_hello(reader, writer, first_frame)
+            else:
+                writer.close()
+                return
+
+            if conn is None:
+                writer.close()
+                return
+
+            conn.start_keepalive()
+            self._connections.append(conn)
+            await self._handler(conn)
+
+        except ValueError as e:
+            logger.warning(f"DIRECT handshake rejected: {e}")
+            writer.close()
+        except asyncio.TimeoutError:
+            logger.warning("DIRECT handshake timeout")
+            writer.close()
+        except Exception as e:
+            logger.error(f"DIRECT connection error: {e}")
+            writer.close()
+        finally:
+            if conn and not conn.is_closed:
+                try:
+                    await conn.close()
+                except Exception:
+                    pass
+
+    async def _handle_hello(self, reader, writer, hello_frame) -> Optional[AgentConnection]:
+        responder = DirectHandshakeResponder(
+            self.agent_id, self.public_key, self.signing_key, self.trust_store,
+            ticket_key=self.ticket_key,
+        )
+        try:
+            ack_frame, result = responder.process_hello(hello_frame, tofu=self.tofu)
+        except ValueError as e:
+            await self._send_error(writer, str(e))
+            return None
+
+        ack_bytes = ack_frame.to_bytes()
+        writer.write(len(ack_bytes).to_bytes(4, "big") + ack_bytes)
+        await writer.drain()
+        result.finalize()
+
+        passport_hash = compute_passport_hash(self.agent_id)
+        encoder = FrameEncoder(passport_hash, self.signing_key, sign_data_frames=False)
+        decoder = FrameDecoder(b"", "")
+        decoder._handshake_complete = True
+
+        peer = PeerInfo(
+            agent_id=result.peer_agent_id,
+            agent_name=result.peer_agent_id,
+            trust_level="DIRECT",
+            verdict="DIRECT_NEW" if result.trust_pin.is_new else "DIRECT_PINNED",
+        )
+        local_passport = AgentPassport(agent_id=self.agent_id, public_key=self.public_key)
+        return AgentConnection(
+            reader=reader, writer=writer, encoder=encoder, decoder=decoder,
+            session_keys=result.session_keys, peer=peer, local_passport=local_passport,
+            max_stream_size=self._max_stream_size,
+            on_frame_sent=self._on_frame_sent, on_frame_received=self._on_frame_received,
+        )
+
+    async def _handle_resume(self, reader, writer, resume_frame) -> Optional[AgentConnection]:
+        if self._resumption_responder is None:
+            await self._send_error(writer, "Resumption not supported by this server")
+            return None
+        try:
+            ack_frame, result = self._resumption_responder.process_resume(resume_frame)
+        except ValueError as e:
+            await self._send_error(writer, str(e))
+            return None
+
+        ack_bytes = ack_frame.to_bytes()
+        writer.write(len(ack_bytes).to_bytes(4, "big") + ack_bytes)
+        await writer.drain()
+
+        peer = PeerInfo(agent_id=result.peer_agent_id, agent_name=result.peer_agent_id,
+                         trust_level="DIRECT", verdict="RESUMED")
+
+        encoder = FrameEncoder(b"\x00" * PASSPORT_HASH_SIZE, self.signing_key, sign_data_frames=False)
+        decoder = FrameDecoder(b"", "")
+        decoder._handshake_complete = True
+
+        return AgentConnection(
+            reader=reader, writer=writer, encoder=encoder, decoder=decoder,
+            session_keys=result.session_keys, peer=peer, local_passport=None,
+            max_stream_size=self._max_stream_size,
+            on_frame_sent=self._on_frame_sent, on_frame_received=self._on_frame_received,
+        )
+
+    async def _send_error(self, writer, message: str):
+        try:
+            payload = serialize_payload({"code": int(ErrorCode.GENERIC), "message": message})
+            encoder = FrameEncoder(b"\x00" * PASSPORT_HASH_SIZE, "")
+            error_frame = encoder.encode(FrameType.ERROR, payload)
+            data = error_frame.to_bytes()
+            writer.write(len(data).to_bytes(4, "big") + data)
+            await writer.drain()
+        except Exception:
+            pass
+        writer.close()

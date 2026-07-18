@@ -43,6 +43,127 @@ def generate_keypair() -> Tuple[str, str]:
     return public_hex, private_hex
 
 
+def load_or_create_keypair(path: str) -> Tuple[str, str]:
+    """
+    Load an Ed25519 keypair from a JSON file, generating and persisting a new
+    one on first use. Returns (public_key_hex, private_key_hex).
+
+    A keypair generated fresh every process start has no continuity — nothing
+    that saw the old public key can recognize the new one. Use this anywhere
+    an agent (or an issuer) needs a stable identity across restarts.
+
+    The file is created with owner-only permissions (0600) on POSIX systems —
+    this holds a raw private key, and on a shared Linux host (the common case
+    for anything actually deployed) a default-umask file is often
+    world-readable, handing the private key to any other local user/process.
+    """
+    import json
+    import logging
+    import os
+    import stat
+
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except Exception:
+            data = None  # Corrupt/unreadable file — fall through and regenerate
+
+        if data is not None:
+            if os.name == "posix":
+                try:
+                    mode = stat.S_IMODE(os.stat(path).st_mode)
+                    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+                        logging.getLogger("LastBastionCrypto").warning(
+                            "Key file %s is readable/writable beyond its owner "
+                            "(mode %o) — tightening to 0600", path, mode
+                        )
+                        os.chmod(path, 0o600)
+                except OSError:
+                    pass
+            return data["public_key"], data["private_key"]
+
+    public_key, private_key = generate_keypair()
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    payload = json.dumps({"public_key": public_key, "private_key": private_key}).encode()
+    # Create with restrictive permissions from the moment the file exists —
+    # no window where it's briefly sitting at the default (often
+    # world-readable) umask before a later chmod call tightens it.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
+
+    return public_key, private_key
+
+
+def load_or_create_issuer_keypair(
+    keys_file: str = ".bastion_keys.json",
+    env_pub: str = "BASTION_ISSUER_PUB",
+    env_priv: str = "BASTION_ISSUER_PRIV",
+) -> Tuple[str, str]:
+    """
+    Resolves the Bastion Protocol issuer keypair.
+
+    Environment variables take priority (production: the real issuer key is
+    provisioned externally, e.g. from a secrets manager). Falls back to a
+    persisted local file so dev/demo restarts don't mint a new issuer
+    identity — which would invalidate every passport issued before restart,
+    since passports are only valid if signed by an issuer key the verifier
+    already recognizes.
+    """
+    import os
+
+    pub = os.environ.get(env_pub, "")
+    priv = os.environ.get(env_priv, "")
+    if pub and priv:
+        return pub, priv
+    return load_or_create_keypair(keys_file)
+
+
+def load_or_create_symmetric_key(path: str, env_var: str = "") -> bytes:
+    """
+    Resolves a raw 32-byte symmetric key (e.g. for NaCl SecretBox), persisted
+    to a JSON file with owner-only (0600) permissions on first use — same
+    reasoning as load_or_create_keypair: a fresh key every restart has no
+    continuity with anything encrypted/decrypted before that restart.
+
+    If env_var is given and set, its hex value is used instead of the file
+    (production: provisioned externally rather than living on disk at all).
+    """
+    import json
+    import os
+
+    if env_var:
+        hex_val = os.environ.get(env_var, "")
+        if hex_val:
+            return bytes.fromhex(hex_val)
+
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            return bytes.fromhex(data["key"])
+        except Exception:
+            pass  # Corrupt/unreadable — fall through and regenerate
+
+    key = os.urandom(32)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    payload = json.dumps({"key": key.hex()}).encode()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
+    return key
+
+
 def sign_bytes(data: bytes, private_key_hex: str) -> str:
     """Sign arbitrary bytes with Ed25519. Returns signature as hex string."""
     sk = SigningKey(bytes.fromhex(private_key_hex))

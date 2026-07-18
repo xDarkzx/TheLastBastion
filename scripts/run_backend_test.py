@@ -1157,7 +1157,7 @@ async def test_phase_20_m2m_protocol():
 
     # --- Test 9: Quotation ---
     engine = QuotationEngine()
-    engine.add_credits("bot-mercury-nz", 100.0)
+    await engine.add_credits("bot-mercury-nz", 100.0)
 
     quote = engine.generate_quote(
         agent_id="bot-mercury-nz",
@@ -1174,9 +1174,9 @@ async def test_phase_20_m2m_protocol():
         return False
 
     # Accept quote
-    accepted = engine.accept_quote(quote.quote_id)
+    accepted = await engine.accept_quote(quote.quote_id)
     if accepted:
-        remaining = engine.get_balance("bot-mercury-nz")
+        remaining = await engine.get_balance("bot-mercury-nz")
         logger.info(f"  OK  Quote accepted, remaining balance: {remaining:.2f}")
     else:
         logger.error("FAIL  Quote acceptance failed")
@@ -1184,13 +1184,13 @@ async def test_phase_20_m2m_protocol():
 
     # Insufficient balance test
     engine2 = QuotationEngine()
-    engine2.add_credits("broke-bot", 0.5)
+    await engine2.add_credits("broke-bot", 0.5)
     expensive_quote = engine2.generate_quote(
         agent_id="broke-bot",
         service_id="svc-data-extraction",
         task_params={"field_count": 20, "region": "global"},
     )
-    denied = engine2.accept_quote(expensive_quote.quote_id)
+    denied = await engine2.accept_quote(expensive_quote.quote_id)
     if not denied:
         logger.info(f"  OK  Insufficient credits rejected")
     else:

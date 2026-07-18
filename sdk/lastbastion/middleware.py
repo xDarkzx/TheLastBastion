@@ -31,6 +31,15 @@ class LastBastionMiddleware(BaseHTTPMiddleware):
     Extracts passport from Authorization: Bearer <jwt> or X-Agent-Passport header.
     Verifies signature, integrity, expiry, and trust level.
     Injects agent context into request.state.agent.
+
+    Budget enforcement here is LOCAL and IN-PROCESS ONLY — it never syncs with
+    the server, so it resets on every restart and each replica behind a load
+    balancer tracks its own separate budget for the same passport (trivially
+    bypassed by reconnecting or hitting a different instance). That's an
+    intentional simplicity/dependency tradeoff for this lightweight
+    integration path. If you need budget enforcement that's authoritative and
+    shared across restarts/replicas, use LastBastionGateway instead — it syncs
+    with the server via sync_budget()/budget_sync_interval.
     """
 
     BUDGET_BY_TRUST = {
@@ -56,6 +65,26 @@ class LastBastionMiddleware(BaseHTTPMiddleware):
         self._verifier = PassportVerifier(issuer_public_key=issuer_public_key)
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._budget_tracker: Dict[str, Dict[str, Any]] = {}  # passport_id -> budget info
+        self._last_budget_evict = time.time()
+
+    # Budget entries not touched in this long are evicted -- passports get a
+    # fresh passport_id on every renewal, so with no eviction this dict grows
+    # for the life of the process even under ordinary legitimate traffic.
+    _BUDGET_ENTRY_TTL_SECONDS = 3600
+    _BUDGET_EVICT_INTERVAL_SECONDS = 300
+
+    def _maybe_evict_stale_budgets(self):
+        """Periodically drops budget entries idle longer than the TTL."""
+        now = time.time()
+        if now - self._last_budget_evict < self._BUDGET_EVICT_INTERVAL_SECONDS:
+            return
+        self._last_budget_evict = now
+        stale = [
+            pid for pid, info in self._budget_tracker.items()
+            if now - info.get("last_seen", 0) > self._BUDGET_ENTRY_TTL_SECONDS
+        ]
+        for pid in stale:
+            del self._budget_tracker[pid]
 
     def _is_excluded(self, path: str) -> bool:
         return any(path.startswith(p) for p in self.exclude_paths)
@@ -85,25 +114,26 @@ class LastBastionMiddleware(BaseHTTPMiddleware):
             )
 
         # Check cache
-        cache_key = hashlib.sha256(jwt_token.encode()).hexdigest()[:16]
+        cache_key = hashlib.sha256(jwt_token.encode()).hexdigest()
         cached = self._cache.get(cache_key)
         if cached and cached["expires"] > time.time():
             request.state.agent = cached["agent_context"]
             return await call_next(request)
 
-        # Verify passport
+        # Verify passport — signature verification is mandatory. Without an
+        # issuer_public_key we have no way to check the signature, so we fail
+        # closed rather than decoding the claims unverified (which would let a
+        # caller self-assert trust_score/verdict/budget with no crypto backing).
+        if not self.issuer_public_key:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": "gateway_misconfigured",
+                    "message": "issuer_public_key not configured — cannot verify passports",
+                },
+            )
         try:
-            if self.issuer_public_key:
-                passport = AgentPassport.from_jwt(jwt_token, self.issuer_public_key)
-            else:
-                # Without issuer key, attempt to decode without verification
-                import json
-                from lastbastion.crypto import _b64url_decode
-                parts = jwt_token.split(".")
-                if len(parts) != 3:
-                    raise ValueError("Invalid JWT format")
-                claims = json.loads(_b64url_decode(parts[1]))
-                passport = AgentPassport(**claims)
+            passport = AgentPassport.from_jwt(jwt_token, self.issuer_public_key)
         except (ValueError, Exception) as e:
             return JSONResponse(
                 status_code=401,
@@ -117,8 +147,8 @@ class LastBastionMiddleware(BaseHTTPMiddleware):
                 content={"error": "passport_expired", "agent_id": passport.agent_id},
             )
 
-        # Check integrity (only if we have issuer key for full verification)
-        if self.issuer_public_key and not passport.verify_integrity():
+        # Check integrity
+        if not passport.verify_integrity():
             return JSONResponse(
                 status_code=401,
                 content={"error": "integrity_failed", "agent_id": passport.agent_id},
@@ -144,6 +174,7 @@ class LastBastionMiddleware(BaseHTTPMiddleware):
             )
 
         # Check interaction budget
+        self._maybe_evict_stale_budgets()
         pid = passport.passport_id
         if pid not in self._budget_tracker:
             self._budget_tracker[pid] = {
@@ -152,8 +183,10 @@ class LastBastionMiddleware(BaseHTTPMiddleware):
                 "agent_id": passport.agent_id,
                 "strikes": 0,
                 "escalation_tier": 0,
+                "last_seen": time.time(),
             }
         budget_info = self._budget_tracker[pid]
+        budget_info["last_seen"] = time.time()
         if budget_info["remaining"] <= 0:
             # Increment strike counter
             budget_info["strikes"] = budget_info.get("strikes", 0) + 1

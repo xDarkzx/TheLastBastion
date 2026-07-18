@@ -1,5 +1,5 @@
-# The Last Bastion Data Refinery — Business Strategy
-**Version**: 1.0 | **Date**: 2026-03-04 | **Status**: DRAFT (Updated: 2026-03-09)
+# The Last Bastion  Data Refinery — Business Strategy
+**Version**: 1.0 | **Date**: 2026-03-04 | **Status**: DRAFT
 Author : daniel Hodgetts
 
 ---
@@ -15,7 +15,7 @@ No one trusts raw data. The M2M economy can't function if every agent has to ind
 
 ## 2. The Product
 
-**The Last Bastion is a Data Refinery.** Raw data goes in. Verified, stamped, machine-readable truth comes out.
+**The Registry Base is a Data Refinery.** Raw data goes in. Verified, stamped, machine-readable truth comes out.
 
 ```
 RAW INPUT → INGEST → CLEAN → VERIFY → STAMP → SERVE
