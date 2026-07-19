@@ -121,7 +121,14 @@ class AgentConnection:
     A single authenticated agent-to-agent connection.
 
     Provides send/recv with automatic encryption, signing, and verification.
-    Thread-safe via asyncio.Lock on send/recv.
+    Safe for concurrent callers on the same connection: send()/send_stream()
+    serialize against each other via _send_lock (held for the whole
+    operation, not per-frame -- send_stream used to release and reacquire
+    the lock between chunks, letting a concurrent send() interleave a frame
+    into the middle of a stream), and recv()/recv_stream() serialize the
+    same way via _recv_lock. Not thread-safe across OS threads -- this is
+    an asyncio.Lock, which only serializes coroutines on the same event
+    loop, not real threads.
     Created by AgentSocket -- not instantiated directly.
     """
 
@@ -233,7 +240,16 @@ class AgentConnection:
                 logger.warning(f"Unexpected frame type: 0x{frame.msg_type:02x}")
 
     async def send_stream(self, data: bytes, chunk_size: int = 1024 * 1024) -> None:
-        """Send large binary data as a stream of chunks."""
+        """Send large binary data as a stream of chunks.
+
+        Holds _send_lock for the WHOLE operation, not per-frame -- the old
+        per-frame locking let a concurrent send()/send_stream() on the same
+        connection interleave its frames into the middle of this stream,
+        since the lock was released and reacquired between every chunk.
+        Uses _write_frame_raw() (no locking) internally since the lock is
+        already held for the duration; calling _write_frame() here would
+        try to reacquire the same non-reentrant asyncio.Lock and deadlock.
+        """
         if self._closed:
             raise ConnectionError("Connection is closed")
 
@@ -243,91 +259,126 @@ class AgentConnection:
         chunk_count = (total_size + chunk_size - 1) // chunk_size
         content_hash = hashlib.sha256(data).digest()
 
-        # STREAM_START
-        start_payload = serialize_payload({
-            "stream_id": stream_id,
-            "total_size": total_size,
-            "chunk_count": chunk_count,
-            "content_hash": content_hash,
-        })
-        start_frame = self._encoder.encode(
-            FrameType.STREAM_START, start_payload, self._encrypt_func
-        )
-        await self._write_frame(start_frame)
-
-        # STREAM_CHUNKs
-        for i in range(chunk_count):
-            offset = i * chunk_size
-            chunk = data[offset:offset + chunk_size]
-            chunk_payload = serialize_payload({
+        async with self._send_lock:
+            # STREAM_START
+            start_payload = serialize_payload({
                 "stream_id": stream_id,
-                "chunk_index": i,
-                "data": chunk,
+                "total_size": total_size,
+                "chunk_count": chunk_count,
+                "content_hash": content_hash,
             })
-            chunk_frame = self._encoder.encode(
-                FrameType.STREAM_CHUNK, chunk_payload, self._encrypt_func
+            start_frame = self._encoder.encode(
+                FrameType.STREAM_START, start_payload, self._encrypt_func
             )
-            await self._write_frame(chunk_frame)
+            await self._write_frame_raw(start_frame)
 
-        # STREAM_END
-        end_payload = serialize_payload({
-            "stream_id": stream_id,
-            "final_hash": content_hash,
-        })
-        end_frame = self._encoder.encode(
-            FrameType.STREAM_END, end_payload, self._encrypt_func
-        )
-        await self._write_frame(end_frame)
+            # STREAM_CHUNKs
+            for i in range(chunk_count):
+                offset = i * chunk_size
+                chunk = data[offset:offset + chunk_size]
+                chunk_payload = serialize_payload({
+                    "stream_id": stream_id,
+                    "chunk_index": i,
+                    "data": chunk,
+                })
+                chunk_frame = self._encoder.encode(
+                    FrameType.STREAM_CHUNK, chunk_payload, self._encrypt_func
+                )
+                await self._write_frame_raw(chunk_frame)
+
+            # STREAM_END
+            end_payload = serialize_payload({
+                "stream_id": stream_id,
+                "final_hash": content_hash,
+            })
+            end_frame = self._encoder.encode(
+                FrameType.STREAM_END, end_payload, self._encrypt_func
+            )
+            await self._write_frame_raw(end_frame)
 
     async def recv_stream(self) -> bytes:
-        """Receive a streamed payload. Returns reassembled bytes."""
-        # Wait for STREAM_START
-        frame = await self._read_frame()
-        if frame.msg_type != FrameType.STREAM_START:
-            raise ConnectionError(f"Expected STREAM_START, got 0x{frame.msg_type:02x}")
+        """Receive a streamed payload. Returns reassembled bytes.
 
-        start_data = deserialize_payload(frame.payload)
-        expected_chunks = start_data["chunk_count"]
-        expected_hash = start_data["content_hash"]
-        total_size = start_data.get("total_size", 0)
-        if isinstance(expected_hash, list):
-            expected_hash = bytes(expected_hash)
+        Holds _recv_lock for the WHOLE operation (see send_stream's
+        docstring for why) and uses _read_frame_raw() internally to avoid
+        deadlocking on the already-held lock. Also validates every
+        STREAM_CHUNK/STREAM_END's stream_id against the STREAM_START that
+        opened this call -- previously chunks were placed by chunk_index
+        alone with no check that they belonged to THIS stream at all, which
+        combined with the per-frame locking bug meant two concurrent
+        streams could silently interleave and corrupt each other's data
+        with no exception raised.
+        """
+        async with self._recv_lock:
+            # Wait for STREAM_START
+            frame = await self._read_frame_raw()
+            if frame.msg_type != FrameType.STREAM_START:
+                raise ConnectionError(f"Expected STREAM_START, got 0x{frame.msg_type:02x}")
 
-        # Enforce stream size cap
-        if total_size > self._max_stream_size:
-            raise ConnectionError(
-                f"Stream too large: {total_size} bytes "
-                f"(max {self._max_stream_size})"
-            )
+            start_data = deserialize_payload(frame.payload)
+            stream_id = start_data["stream_id"]
+            if isinstance(stream_id, list):
+                stream_id = bytes(stream_id)
+            expected_chunks = start_data["chunk_count"]
+            expected_hash = start_data["content_hash"]
+            total_size = start_data.get("total_size", 0)
+            if isinstance(expected_hash, list):
+                expected_hash = bytes(expected_hash)
 
-        # Receive chunks
-        chunks = [None] * expected_chunks
-        for _ in range(expected_chunks):
-            chunk_frame = await self._read_frame()
-            if chunk_frame.msg_type == FrameType.PING:
-                await self._send_pong()
-                chunk_frame = await self._read_frame()
-            if chunk_frame.msg_type != FrameType.STREAM_CHUNK:
-                raise ConnectionError(f"Expected STREAM_CHUNK, got 0x{chunk_frame.msg_type:02x}")
-            chunk_data = deserialize_payload(chunk_frame.payload)
-            idx = chunk_data["chunk_index"]
-            chunk_bytes = chunk_data["data"]
-            if isinstance(chunk_bytes, list):
-                chunk_bytes = bytes(chunk_bytes)
-            chunks[idx] = chunk_bytes
+            # Enforce stream size cap
+            if total_size > self._max_stream_size:
+                raise ConnectionError(
+                    f"Stream too large: {total_size} bytes "
+                    f"(max {self._max_stream_size})"
+                )
 
-        # Wait for STREAM_END
-        end_frame = await self._read_frame()
-        if end_frame.msg_type != FrameType.STREAM_END:
-            raise ConnectionError(f"Expected STREAM_END, got 0x{end_frame.msg_type:02x}")
+            # Receive chunks
+            chunks = [None] * expected_chunks
+            for _ in range(expected_chunks):
+                chunk_frame = await self._read_frame_raw()
+                if chunk_frame.msg_type == FrameType.PING:
+                    pong = self._encoder.encode_pong(self._encrypt_func)
+                    async with self._send_lock:
+                        await self._write_frame_raw(pong)
+                    chunk_frame = await self._read_frame_raw()
+                if chunk_frame.msg_type != FrameType.STREAM_CHUNK:
+                    raise ConnectionError(f"Expected STREAM_CHUNK, got 0x{chunk_frame.msg_type:02x}")
+                chunk_data = deserialize_payload(chunk_frame.payload)
+                chunk_stream_id = chunk_data["stream_id"]
+                if isinstance(chunk_stream_id, list):
+                    chunk_stream_id = bytes(chunk_stream_id)
+                if chunk_stream_id != stream_id:
+                    raise ConnectionError(
+                        f"STREAM_CHUNK belongs to a different stream "
+                        f"({chunk_stream_id.hex()} != {stream_id.hex()})"
+                    )
+                idx = chunk_data["chunk_index"]
+                chunk_bytes = chunk_data["data"]
+                if isinstance(chunk_bytes, list):
+                    chunk_bytes = bytes(chunk_bytes)
+                chunks[idx] = chunk_bytes
 
-        # Reassemble and verify hash
-        assembled = b"".join(chunks)
-        actual_hash = hashlib.sha256(assembled).digest()
-        if actual_hash != expected_hash:
-            raise ConnectionError("Stream hash mismatch -- data corrupted or tampered")
+            # Wait for STREAM_END
+            end_frame = await self._read_frame_raw()
+            if end_frame.msg_type != FrameType.STREAM_END:
+                raise ConnectionError(f"Expected STREAM_END, got 0x{end_frame.msg_type:02x}")
+            end_data = deserialize_payload(end_frame.payload)
+            end_stream_id = end_data["stream_id"]
+            if isinstance(end_stream_id, list):
+                end_stream_id = bytes(end_stream_id)
+            if end_stream_id != stream_id:
+                raise ConnectionError(
+                    f"STREAM_END belongs to a different stream "
+                    f"({end_stream_id.hex()} != {stream_id.hex()})"
+                )
 
-        return assembled
+            # Reassemble and verify hash
+            assembled = b"".join(chunks)
+            actual_hash = hashlib.sha256(assembled).digest()
+            if actual_hash != expected_hash:
+                raise ConnectionError("Stream hash mismatch -- data corrupted or tampered")
+
+            return assembled
 
     async def close(self):
         """Clean bidirectional shutdown: send CLOSE, wait for CLOSE back."""

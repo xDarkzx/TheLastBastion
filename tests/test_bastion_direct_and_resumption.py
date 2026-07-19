@@ -444,6 +444,89 @@ def test_socket_fresh_handshake_and_data_exchange():
     asyncio.run(run())
 
 
+def test_socket_concurrent_streams_do_not_corrupt_each_other():
+    """
+    Regression test for a real bug: send_stream() used to acquire/release
+    _send_lock per-frame (via _write_frame()), not for the whole stream --
+    two concurrent send_stream() calls on the same connection could
+    interleave their STREAM_START/CHUNK/END frames on the wire. recv_stream()
+    also never checked a chunk's stream_id against the stream it was
+    assembling, so an interleaved chunk from a DIFFERENT stream would be
+    silently placed into the wrong reassembly buffer with no exception.
+
+    Fires two concurrent send_stream() calls on the SAME connection with
+    distinct, verifiably-different payloads, and confirms both are received
+    completely intact (correct hash) via two recv_stream() calls -- if
+    frames interleaved or a chunk landed in the wrong stream, either the
+    hash check inside recv_stream() would fail, or this test's own
+    byte-for-byte comparison would.
+    """
+    async def run():
+        d = tempfile.mkdtemp()
+        store_client = PeerTrustStore(os.path.join(d, "client.json"))
+        store_server = PeerTrustStore(os.path.join(d, "server.json"))
+        pub_c, priv_c = generate_keypair()
+        pub_s, priv_s = generate_keypair()
+
+        received = []
+
+        async def handle(conn):
+            # Two sequential recv_stream() calls -- each fully serialized by
+            # _recv_lock, receiving whichever stream's STREAM_START arrives
+            # first on the wire (order between the two concurrent senders
+            # isn't guaranteed, and doesn't need to be -- correctness here
+            # means neither stream's bytes end up corrupted or merged).
+            received.append(await conn.recv_stream())
+            received.append(await conn.recv_stream())
+            await conn.close()
+
+        server = DirectAgentSocket.listen(
+            agent_id="server-agent", public_key=pub_s, signing_key=priv_s,
+            trust_store=store_server, port=19315,
+        )
+        server.on_connect(handle)
+        await server.start_background()
+        await asyncio.sleep(0.1)
+
+        try:
+            conn, _t, _s = await DirectAgentSocket.connect(
+                "localhost", agent_id="client-agent", public_key=pub_c,
+                signing_key=priv_c, trust_store=store_client, port=19315,
+            )
+            # Distinct payloads with a small chunk_size relative to size --
+            # many chunks means many per-frame lock acquire/release cycles
+            # on the old code, maximizing the interleaving window. Verified
+            # empirically against the pre-fix code (git-stashed and run
+            # directly): chunk_size=4096 with 50KB payloads didn't reliably
+            # trigger the race on fast localhost loopback (no real
+            # backpressure = no forced yield point for asyncio to actually
+            # switch tasks at), but chunk_size=64 with 500KB payloads
+            # reliably did -- it crashed the old code with
+            # ConnectionResetError from interleaved frames desyncing the
+            # wire protocol. That's this bug manifesting as a hard failure
+            # rather than silent corruption, and is exactly what these
+            # sizes are chosen to reproduce reliably.
+            payload_a = b"A" * 500_000 + os.urandom(8)
+            payload_b = b"B" * 500_000 + os.urandom(8)
+
+            await asyncio.gather(
+                conn.send_stream(payload_a, chunk_size=64),
+                conn.send_stream(payload_b, chunk_size=64),
+            )
+
+            await asyncio.sleep(1.0)  # let the server finish both recv_stream() calls (~15.6k frames total)
+            await conn.close()
+        finally:
+            await server.stop()
+
+        assert len(received) == 2
+        assert {payload_a, payload_b} == set(received), (
+            "both streams must arrive byte-for-byte intact and unmerged"
+        )
+
+    asyncio.run(run())
+
+
 def test_socket_resumption_over_the_wire():
     async def run():
         d = tempfile.mkdtemp()
