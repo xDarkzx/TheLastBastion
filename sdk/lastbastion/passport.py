@@ -26,15 +26,13 @@ import json
 import time
 import uuid
 import platform
-import socket
-from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
 from pydantic import BaseModel, Field
 
 from lastbastion.crypto import (
-    create_jwt, verify_jwt, compute_hash, sign_bytes, verify_signature,
-    generate_keypair, create_signed_envelope, verify_signed_envelope,
+    create_jwt, verify_jwt, verify_signature,
+    create_signed_envelope, verify_signed_envelope,
 )
 
 

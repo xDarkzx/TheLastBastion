@@ -4,13 +4,17 @@ Agent Communication Protocol (ACP) — The Last Bastion M2M Foundation.
 DEPRECATED (as of the Bastion Protocol work): the ProtocolMessage/MessageType
 signed-JSON-envelope pieces of this module are superseded by Bastion Protocol
 (sdk/lastbastion/protocol/) — same Ed25519 identity and replay protection,
-but binary (MessagePack, not JSON) and materially faster. Nothing in the live
-/m2m/* HTTP endpoints signs or verifies a ProtocolMessage anymore; that path
-uses plain REST + API keys (see protocols/auth.py's authenticate_api_key).
-ProtocolMessage/sign_message/authenticate_message are kept only because
-scripts/run_backend_test.py (Phase 20) and core/attacks/replay.py still
-exercise them — don't build new features on this envelope; use Bastion
-Protocol instead.
+but binary (MessagePack, not JSON). NOT faster, measured directly: rigorous
+multi-trial benchmarking (documents/BENCHMARK_METHODOLOGY.md) found Bastion
+Protocol slower than plain JSON on every configuration tested (0.19x-0.62x
+of JSON's throughput) -- this module is deprecated for its security
+properties (structured identity/replay protection this plain-JSON envelope
+never had), not for speed. Nothing in the live /m2m/* HTTP endpoints signs
+or verifies a ProtocolMessage anymore; that path uses plain REST + API keys
+(see protocols/auth.py's authenticate_api_key). ProtocolMessage/
+sign_message/authenticate_message are kept only because
+scripts/run_backend_test.py (Phase 20) still exercises them -- don't build
+new features on this envelope; use Bastion Protocol instead.
 
 AgentIdentity/AgentRole below are NOT part of that deprecation — they're the
 shared identity model used across AgentRegistry, M2MAuthenticator, and the

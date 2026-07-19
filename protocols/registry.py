@@ -16,6 +16,7 @@ Service Catalog:
     - "attestation" — provenance proof for physical documents
 """
 import logging
+import time as _time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -161,6 +162,15 @@ class AgentRegistry:
     # Agents not seen for this long are marked stale
     STALE_THRESHOLD_HOURS = 24
 
+    # register_agent() is reachable unauthenticated via POST /m2m/register
+    # with a client-supplied agent_id, and get_stale_agents() was previously
+    # defined but never called by anything -- _agents/_agent_services grew
+    # without bound (one entry per unique agent_id ever registered, forever).
+    # These bound it: a periodic staleness sweep plus a hard cap as
+    # defense-in-depth for growth within the staleness window itself.
+    _MAX_AGENTS = 5000
+    _AGENT_EVICT_INTERVAL_SECONDS = 300
+
     def __init__(self) -> None:
         self._agents: Dict[str, AgentIdentity] = {}
         self._services: Dict[str, ServiceListing] = {}
@@ -171,11 +181,40 @@ class AgentRegistry:
             "total_services": 0,
             "queries_served": 0,
         }
+        self._last_agent_evict = _time.time()
 
         # Register The Last Bastion's own services
         self._register_registry_base_services()
         # Restore externally-registered services that survived a restart
         self._load_persisted_services()
+
+    def _drop_agent(self, agent_id: str) -> None:
+        """In-memory-only agent removal used by the eviction sweep (no DB/async cleanup — see deregister_agent for the full, explicit teardown)."""
+        if self._agents.pop(agent_id, None) is None:
+            return
+        for svc_id in self._agent_services.pop(agent_id, []):
+            if self._services.pop(svc_id, None) is not None:
+                self._stats["total_services"] -= 1
+        self._stats["total_agents"] -= 1
+        self._stats["active_agents"] -= 1
+
+    def _maybe_evict_stale_agents(self) -> None:
+        """Periodically drops stale agents, then hard-caps total count."""
+        now = _time.time()
+        if now - self._last_agent_evict < self._AGENT_EVICT_INTERVAL_SECONDS:
+            return
+        self._last_agent_evict = now
+
+        for agent_id in self.get_stale_agents():
+            self._drop_agent(agent_id)
+
+        if len(self._agents) > self._MAX_AGENTS:
+            excess = len(self._agents) - self._MAX_AGENTS
+            oldest = sorted(
+                self._agents.values(), key=lambda a: a.last_seen or ""
+            )[:excess]
+            for agent in oldest:
+                self._drop_agent(agent.agent_id)
 
     def register_agent(
         self, identity: AgentIdentity
@@ -191,6 +230,11 @@ class AgentRegistry:
         if is_new:
             self._stats["total_agents"] += 1
             self._stats["active_agents"] += 1
+
+        # Evict after inserting (not before) so the cap below reflects the
+        # post-registration count, matching m2m_router.py's _evict_cache
+        # pattern (write, then evict) rather than off-by-one under-capping.
+        self._maybe_evict_stale_agents()
 
         logger.info(
             f"{'Registered' if is_new else 'Updated'} agent: "

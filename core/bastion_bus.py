@@ -75,6 +75,12 @@ class BastionProtocolBus:
     Supports WebSocket broadcast via on_event callback.
     """
 
+    # Caps on the two unbounded-by-session-id/agent-id dicts below, evicted oldest-first
+    # (same insertion-order eviction pattern as m2m_router.py's _evict_cache) as
+    # defense-in-depth against any caller that fails to record a terminal event.
+    _MAX_ACTIVE_SESSIONS = 500
+    _MAX_AGENT_LAST_SEEN = 500
+
     def __init__(self, maxlen: int = 1000):
         self._buffer: deque = deque(maxlen=maxlen)
         self._lock = threading.Lock()
@@ -161,13 +167,25 @@ class BastionProtocolBus:
                 self._agent_last_seen[sender_agent] = now
             if receiver_agent:
                 self._agent_last_seen[receiver_agent] = now
+            if len(self._agent_last_seen) > self._MAX_AGENT_LAST_SEEN:
+                excess = len(self._agent_last_seen) - self._MAX_AGENT_LAST_SEEN
+                oldest = sorted(self._agent_last_seen, key=self._agent_last_seen.get)[:excess]
+                for k in oldest:
+                    del self._agent_last_seen[k]
 
             if event_type == "HANDSHAKE_COMPLETE":
                 self._handshakes_completed += 1
 
-            # Track active sessions
+            # Track active sessions. ERROR is treated as terminal alongside
+            # CONNECTION_CLOSED: callers that fail mid-handshake/mid-frame
+            # (auth rejection, timeout, transport error) record an ERROR event
+            # for the session but were never guaranteed to also record a clean
+            # CONNECTION_CLOSED afterwards, which left the entry in
+            # _active_sessions forever (unbounded growth — one leaked entry per
+            # failed connection attempt). The size cap below is defense-in-depth
+            # for any other path that isn't covered.
             if session_id:
-                if event_type == "CONNECTION_CLOSED":
+                if event_type in ("CONNECTION_CLOSED", "ERROR"):
                     self._active_sessions.pop(session_id, None)
                 else:
                     if session_id not in self._active_sessions:
@@ -185,6 +203,12 @@ class BastionProtocolBus:
                     if event_type == "HANDSHAKE_COMPLETE":
                         sess["state"] = "ESTABLISHED"
                     sess["last_activity"] = entry.timestamp
+
+                if len(self._active_sessions) > self._MAX_ACTIVE_SESSIONS:
+                    excess = len(self._active_sessions) - self._MAX_ACTIVE_SESSIONS
+                    oldest = list(self._active_sessions.keys())[:excess]
+                    for k in oldest:
+                        del self._active_sessions[k]
 
         # Fire WebSocket broadcast
         if self._on_event_callback:

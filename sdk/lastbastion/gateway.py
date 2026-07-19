@@ -403,10 +403,12 @@ class LastBastionGateway:
 
     def refresh_budget(self, passport_id: str, new_budget: int):
         """Called after re-verification to reset budget."""
+        self._maybe_evict_stale_budgets()
         info = self._budget_tracker.get(passport_id)
         if info:
             info["remaining"] = new_budget
             info["max"] = new_budget
+            info["last_seen"] = time.time()
             info["last_sync"] = time.time()
         else:
             self._budget_tracker[passport_id] = {

@@ -142,6 +142,24 @@ quotation = QuotationEngine()
 # Sybil script (which needs hundreds of identities to matter) while covering
 # this platform's own largest legitimate registration burst with headroom.
 _registration_rate_limiter = RateLimiter(default_limit=30)
+# /m2m/activity and /dashboard/agents/register had no auth AND no rate limit
+# -- anyone could insert fabricated activity-feed entries or fake directory
+# listings with unlimited unauthenticated requests. Full auth (ADMIN_KEY,
+# used elsewhere in this file for genuinely human/operator-only actions)
+# doesn't fit either endpoint: both are routinely called by this platform's
+# own internal agent network as automated telemetry/self-registration
+# (core/agent_simulator.py), not by a human operator -- gating them on an
+# admin credential would work today only because ADMIN_KEY happens to be
+# unset, and would silently break the system's own internal calls the
+# moment someone actually hardens the deployment. A per-IP rate limit caps
+# abuse without that trap. 300/min for activity (called frequently, once
+# per demo event -- deliberately generous headroom after this session's
+# own earlier lesson: a too-tight limit here silently breaks the
+# platform's own internal telemetry burst, same as the registration
+# limiter mistake this comment's neighbor already learned from); 30/min
+# for registration (called rarely, once per agent at startup).
+_activity_rate_limiter = RateLimiter(default_limit=300)
+_dashboard_register_rate_limiter = RateLimiter(default_limit=30)
 blockchain_anchor = BlockchainAnchor()  # Reads env vars, gracefully degrades
 verification_pipeline = VerificationPipeline(
     blockchain_anchor=blockchain_anchor,
@@ -291,6 +309,7 @@ async def recover_orphaned_tasks():
             import asyncio
             asyncio.create_task(_execute_task_background(tid))
             logger.info(f"RECOVERED orphaned task: {tid} (was {task['status']})")
+    _evict_cache(_tasks, _MAX_TASKS_CACHE)
     return recovered
 
 router = APIRouter(prefix="/m2m", tags=["M2M"])
@@ -905,6 +924,7 @@ async def m2m_status(
         task = get_production_task(task_id)
         if task:
             _tasks[task_id] = task  # warm cache
+            _evict_cache(_tasks, _MAX_TASKS_CACHE)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
@@ -938,6 +958,7 @@ async def m2m_result(
         task = get_production_task(task_id)
         if task:
             _tasks[task_id] = task
+            _evict_cache(_tasks, _MAX_TASKS_CACHE)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
@@ -1672,6 +1693,7 @@ async def refinery_submit(
     if existing:
         logger.info(f"REFINERY: duplicate hash={data_hash[:16]}... returning cached verdict")
         _results[data_hash] = existing  # warm cache
+        _evict_cache(_results, _MAX_RESULTS_CACHE)
         protocol_bus.record(
             direction="INBOUND", message_type="REFINERY_SUBMIT",
             sender_id=request.source_agent_id, endpoint="/refinery/submit",
@@ -1799,6 +1821,7 @@ async def refinery_submit(
             "source_agent_id": request.source_agent_id,
             "submitted_at": datetime.utcnow().isoformat() + "Z",
         }
+        _evict_cache(_results, _MAX_RESULTS_CACHE)
         return {
             "data_hash": data_hash,
             "submission_id": submission_id,
@@ -1823,6 +1846,7 @@ async def refinery_status(data_hash: str):
     db_result = get_verification_by_hash(data_hash)
     if db_result:
         _results[data_hash] = db_result  # warm cache
+        _evict_cache(_results, _MAX_RESULTS_CACHE)
         return db_result
 
     raise HTTPException(status_code=404, detail="Submission not found")
@@ -2529,12 +2553,20 @@ async def dashboard_bastion_comparison():
 
 
 @router.post("/dashboard/agents/{agent_id}/verify")
-async def dashboard_verify_agent(agent_id: str):
+async def dashboard_verify_agent(agent_id: str, x_admin_key: str = Header(default="")):
     """
     Triggers agent verification from the dashboard UI.
 
     Looks up the agent's registered data and runs the AgentVerifier pipeline.
+    Protected by ADMIN_KEY when set in environment -- previously had no
+    authentication at all, so any caller could trigger the full 10-check
+    verification pipeline (real DB writes, real pipeline compute cost) for
+    any agent_id with a single unauthenticated POST.
     """
+    admin_key = os.getenv("ADMIN_KEY", "")
+    if admin_key and x_admin_key != admin_key:
+        raise HTTPException(status_code=401, detail="Admin authentication required")
+
     from datetime import timedelta
 
     _t0 = _time.monotonic()
@@ -2666,8 +2698,11 @@ class DashboardAgentRegister(BaseModel):
 
 
 @router.post("/activity")
-async def post_activity(event: ActivityEvent):
+async def post_activity(event: ActivityEvent, http_request: Request):
     """Records a supply chain activity event for the dashboard feed."""
+    allowed, _remaining = _activity_rate_limiter.check(_client_ip(http_request))
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Too many activity posts -- try again later")
     entry = {
         "id": len(_activity_feed) + 1,
         "phase": event.phase,
@@ -2699,8 +2734,11 @@ async def dashboard_pending_anchors(limit: int = Query(default=50, le=200)):
 
 
 @router.post("/dashboard/agents/register")
-async def dashboard_register_agent(agent: DashboardAgentRegister):
+async def dashboard_register_agent(agent: DashboardAgentRegister, http_request: Request):
     """Registers an agent for the dashboard Agent Directory. Persisted to DB."""
+    allowed, _remaining = _dashboard_register_rate_limiter.check(_client_ip(http_request))
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Too many registration attempts -- try again later")
     entry_data = {
         "agent_id": agent.agent_id,
         "name": agent.name,
@@ -3055,11 +3093,14 @@ async def issue_passport(
     except Exception as e:
         logger.error(f"PASSPORT: DB save failed (non-fatal): {e}")
 
-    protocol_bus.log(
-        source=agent_id,
-        target="passport-service",
-        msg_type="PASSPORT_ISSUED",
-        summary=f"Passport issued for {req.agent_id} (trust={trust_score:.2f})",
+    protocol_bus.record(
+        direction="INBOUND", message_type="PASSPORT_ISSUED",
+        sender_id=agent_id, recipient_id="passport-service",
+        endpoint="/m2m/passport/issue",
+        auth_result="AUTHENTICATED",
+        payload_summary=f"Passport issued for {req.agent_id} (trust={trust_score:.2f})",
+        nonce=secrets.token_hex(8),
+        protocol_version=PROTOCOL_VERSION,
     )
 
     return {
@@ -3289,7 +3330,13 @@ async def report_budget_strike_endpoint(req: BudgetStrikeRequest):
             reason=f"Budget abuse escalation tier 1 ({strikes} strikes)",
             event_type="escalation_tier_1",
         )
-        protocol_bus.log("ESCALATION", f"Tier 1: agent {agent_id} trust {old_score:.2f} → {new_score:.2f} ({strikes} strikes)")
+        protocol_bus.record(
+            direction="INBOUND", message_type="ESCALATION",
+            sender_id=agent_id, endpoint="/passport/budget/strike",
+            auth_result="SKIPPED",
+            payload_summary=f"Tier 1: agent {agent_id} trust {old_score:.2f} → {new_score:.2f} ({strikes} strikes)",
+            nonce=secrets.token_hex(8), protocol_version=PROTOCOL_VERSION,
+        )
         response["action_taken"] = "trust_penalty_0.05"
 
     elif tier_triggered == 2:
@@ -3304,7 +3351,13 @@ async def report_budget_strike_endpoint(req: BudgetStrikeRequest):
             reason=f"Budget abuse escalation tier 2 ({strikes} strikes) → SUSPICIOUS",
             event_type="escalation_tier_2",
         )
-        protocol_bus.log("ESCALATION", f"Tier 2: agent {agent_id} → SUSPICIOUS, trust {old_score:.2f} → {new_score:.2f}")
+        protocol_bus.record(
+            direction="INBOUND", message_type="ESCALATION",
+            sender_id=agent_id, endpoint="/passport/budget/strike",
+            auth_result="SKIPPED",
+            payload_summary=f"Tier 2: agent {agent_id} → SUSPICIOUS, trust {old_score:.2f} → {new_score:.2f}",
+            nonce=secrets.token_hex(8), protocol_version=PROTOCOL_VERSION,
+        )
         response["action_taken"] = "trust_penalty_0.15_suspicious"
 
     elif tier_triggered == 3:
@@ -3320,7 +3373,13 @@ async def report_budget_strike_endpoint(req: BudgetStrikeRequest):
             reason=f"Budget abuse escalation tier 3 ({strikes} strikes) → MALICIOUS, keys+passport revoked",
             event_type="escalation_tier_3",
         )
-        protocol_bus.log("ESCALATION", f"Tier 3: agent {agent_id} → MALICIOUS, {keys_revoked} keys revoked, passport revoked")
+        protocol_bus.record(
+            direction="INBOUND", message_type="ESCALATION",
+            sender_id=agent_id, endpoint="/passport/budget/strike",
+            auth_result="SKIPPED",
+            payload_summary=f"Tier 3: agent {agent_id} → MALICIOUS, {keys_revoked} keys revoked, passport revoked",
+            nonce=secrets.token_hex(8), protocol_version=PROTOCOL_VERSION,
+        )
         response["action_taken"] = "malicious_lockout"
         response["keys_revoked"] = keys_revoked
         response["passport_revoked"] = passport_revoked
@@ -3356,12 +3415,30 @@ class AppealRequest(BaseModel):
 async def file_appeal(
     req: AppealRequest,
     x_api_key_id: str = Header("", alias="X-API-Key-ID"),
+    x_admin_key: str = Header(default=""),
 ):
     """
     File an appeal against an escalation lockout.
     Uses the organization's API key (agent's keys are revoked at tier 3).
     Only one PENDING appeal per agent allowed.
+    Protected by ADMIN_KEY when set in environment.
+
+    x_api_key_id was accepted as a header but never actually validated --
+    no secret pairing, no ownership check against req.agent_id, so anyone
+    could file (and, since /appeal/{id}/resolve had the same gap, also
+    approve) an appeal for any agent with zero credentials, fully
+    bypassing the escalation-lockout security control this endpoint pair
+    exists to gate. A locked-out agent's own API key is revoked at tier 3
+    per this docstring, so a per-agent credential check can't be the right
+    model here anyway -- ADMIN_KEY (the same gate already used for
+    /refinery/quarantine/*/resolve and /anchoring/approve/*, both other
+    "an operator, not the agent itself, approves this" actions) is the
+    correct, conservative fit, not a new bespoke auth tier.
     """
+    admin_key = os.getenv("ADMIN_KEY", "")
+    if admin_key and x_admin_key != admin_key:
+        raise HTTPException(status_code=401, detail="Admin authentication required")
+
     # Check for existing open appeal
     existing = list_agent_appeals(agent_id=req.agent_id, status="PENDING")
     if existing:
@@ -3398,7 +3475,13 @@ async def file_appeal(
         verdict_at_filing=trust_info.get("status", ""),
     )
 
-    protocol_bus.log("APPEAL", f"Appeal filed for agent {req.agent_id}: {appeal['appeal_id']}")
+    protocol_bus.record(
+        direction="INBOUND", message_type="APPEAL",
+        sender_id=req.agent_id, endpoint="/m2m/appeal",
+        auth_result="SKIPPED",
+        payload_summary=f"Appeal filed for agent {req.agent_id}: {appeal['appeal_id']}",
+        nonce=secrets.token_hex(8), protocol_version=PROTOCOL_VERSION,
+    )
 
     return {
         **appeal,
@@ -3422,12 +3505,29 @@ class ResolveAppealRequest(BaseModel):
 
 
 @router.post("/appeal/{appeal_id}/resolve")
-async def resolve_appeal(appeal_id: str, req: ResolveAppealRequest):
+async def resolve_appeal(
+    appeal_id: str,
+    req: ResolveAppealRequest,
+    x_admin_key: str = Header(default=""),
+):
     """
     Admin resolves an appeal.
     APPROVED: trust restored to BASIC (0.55), escalation cleared.
     DENIED: lockout stands.
+    Protected by ADMIN_KEY when set in environment.
+
+    Previously had NO authentication of any kind -- anyone could approve
+    any pending appeal for any agent with a single unauthenticated POST,
+    completely bypassing the escalation-lockout mechanism this exists to
+    gate (chain: lock an agent out, file an appeal for it, resolve that
+    appeal APPROVED -- zero credentials needed at any step). See
+    file_appeal's docstring for why ADMIN_KEY, not a per-agent API key,
+    is the correct fix.
     """
+    admin_key = os.getenv("ADMIN_KEY", "")
+    if admin_key and x_admin_key != admin_key:
+        raise HTTPException(status_code=401, detail="Admin authentication required")
+
     if req.status not in ("APPROVED", "DENIED"):
         raise HTTPException(status_code=422, detail="status must be APPROVED or DENIED")
 
@@ -3478,7 +3578,14 @@ async def resolve_appeal(appeal_id: str, req: ResolveAppealRequest):
             trust_score_restored_to=restored_score,
             passport_renewed=False,  # Must re-register for new keys
         )
-        protocol_bus.log("APPEAL", f"Appeal {appeal_id} APPROVED for agent {agent_id} by {req.resolved_by}")
+        protocol_bus.record(
+            direction="OUTBOUND", message_type="APPEAL",
+            sender_id="registry-base", recipient_id=agent_id,
+            endpoint=f"/m2m/appeal/{appeal_id}/resolve",
+            auth_result="SKIPPED",
+            payload_summary=f"Appeal {appeal_id} APPROVED for agent {agent_id} by {req.resolved_by}",
+            nonce=secrets.token_hex(8), protocol_version=PROTOCOL_VERSION,
+        )
     else:
         result = resolve_agent_appeal(
             appeal_id=appeal_id,
@@ -3486,7 +3593,14 @@ async def resolve_appeal(appeal_id: str, req: ResolveAppealRequest):
             resolved_by=req.resolved_by,
             resolution_notes=req.resolution_notes,
         )
-        protocol_bus.log("APPEAL", f"Appeal {appeal_id} DENIED for agent {agent_id} by {req.resolved_by}")
+        protocol_bus.record(
+            direction="OUTBOUND", message_type="APPEAL",
+            sender_id="registry-base", recipient_id=agent_id,
+            endpoint=f"/m2m/appeal/{appeal_id}/resolve",
+            auth_result="SKIPPED",
+            payload_summary=f"Appeal {appeal_id} DENIED for agent {agent_id} by {req.resolved_by}",
+            nonce=secrets.token_hex(8), protocol_version=PROTOCOL_VERSION,
+        )
 
     return result
 

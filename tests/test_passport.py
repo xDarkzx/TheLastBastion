@@ -161,6 +161,7 @@ def test_passport_verifier():
         trust_score=0.80,
         trust_level="VERIFIED",
         verdict="TRUSTED",
+        issuer_public_key=pub,
     )
     passport.seal()
 
@@ -272,6 +273,44 @@ def test_gateway_caching():
         assert d2.cached
     asyncio.run(_test())
     print("  PASS: Gateway caching works")
+
+
+def test_gateway_refresh_budget_evicts_stale_and_updates_last_seen():
+    """
+    refresh_budget() previously mutated an existing budget-tracker entry
+    without ever calling _maybe_evict_stale_budgets() or refreshing
+    last_seen -- a re-verified agent's entry could still get swept as
+    "stale" by the next _init_budget() call despite just being refreshed,
+    and refresh_budget() itself never gave the sweep a chance to run.
+    """
+    from lastbastion.gateway import LastBastionGateway as GW
+
+    gw = GW(require_passport=False, verify_online=False)
+    gw._budget_tracker["live-pid"] = {
+        "remaining": 0, "max": 100, "last_sync": time.time(),
+        "last_seen": time.time(), "agent_id": "agent-live",
+        "strikes": 0, "escalation_tier": 0,
+    }
+    # A stale entry old enough to be past the TTL
+    gw._budget_tracker["stale-pid"] = {
+        "remaining": 5, "max": 100, "last_sync": 0,
+        "last_seen": time.time() - gw._BUDGET_ENTRY_TTL_SECONDS - 1,
+        "agent_id": "agent-stale", "strikes": 0, "escalation_tier": 0,
+    }
+    # Force the periodic-interval gate open so eviction actually runs now
+    gw._last_budget_evict = 0
+
+    gw.refresh_budget("live-pid", 50)
+
+    assert "stale-pid" not in gw._budget_tracker, (
+        "refresh_budget should give the stale-entry sweep a chance to run"
+    )
+    info = gw._budget_tracker["live-pid"]
+    assert info["remaining"] == 50 and info["max"] == 50
+    assert time.time() - info["last_seen"] < 1, (
+        "refresh_budget should count as activity and refresh last_seen"
+    )
+    print("  PASS: refresh_budget sweeps stale entries and refreshes last_seen")
 
 
 def test_compute_hash():
@@ -774,6 +813,7 @@ if __name__ == "__main__":
         ("Gateway: Trust levels", test_gateway_trust_levels),
         ("Gateway: No passport", test_gateway_check_no_passport),
         ("Gateway: Caching", test_gateway_caching),
+        ("Gateway: refresh_budget evicts stale entries", test_gateway_refresh_budget_evicts_stale_and_updates_last_seen),
         ("SDK: Exceptions", test_exceptions),
         ("SDK: Models", test_models),
         ("Budget: Decrement tracking", test_budget_decrement),
