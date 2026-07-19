@@ -1531,8 +1531,8 @@ class AgentNetwork:
             direction="SENT",
             sequence=seq,
             passport_hash=AGENT_IDENTITY[sender]["passport_hash"],
-            signature_verified=True,
-            encrypted=True,
+            signature_verified=False,
+            encrypted=False,
             payload_size=payload_size,
             total_frame_size=payload_size + overhead,
             session_id=session_id,
@@ -1555,8 +1555,8 @@ class AgentNetwork:
             direction="RECEIVED",
             sequence=seq,
             passport_hash=AGENT_IDENTITY[receiver]["passport_hash"],
-            signature_verified=True,
-            encrypted=True,
+            signature_verified=False,
+            encrypted=False,
             payload_size=32,
             total_frame_size=32 + overhead,
             session_id=session_id,
@@ -1583,8 +1583,8 @@ class AgentNetwork:
                 direction="SENT",
                 sequence=seq,
                 passport_hash=AGENT_IDENTITY[sender]["passport_hash"],
-                signature_verified=True,
-                encrypted=True,
+                signature_verified=False,
+                encrypted=False,
                 payload_size=att["size"],
                 total_frame_size=att["size"] + overhead,
                 session_id=session_id,
@@ -1607,8 +1607,8 @@ class AgentNetwork:
                 direction="RECEIVED",
                 sequence=seq,
                 passport_hash=AGENT_IDENTITY[receiver]["passport_hash"],
-                signature_verified=True,
-                encrypted=True,
+                signature_verified=False,
+                encrypted=False,
                 payload_size=32,
                 total_frame_size=32 + overhead,
                 session_id=session_id,
@@ -1680,7 +1680,7 @@ class AgentNetwork:
             sender_agent=sender, receiver_agent=receiver,
             direction="SENT", sequence=1,
             passport_hash=AGENT_IDENTITY[sender]["passport_hash"],
-            signature_verified=True, encrypted=True,
+            signature_verified=False, encrypted=False,
             payload_size=128, total_frame_size=128 + overhead,
             session_id=session_id,
             trust_score=self._agent_trust(sender),
@@ -1703,7 +1703,7 @@ class AgentNetwork:
                 sender_agent=sender, receiver_agent=receiver,
                 direction="SENT", sequence=i + 2,
                 passport_hash=AGENT_IDENTITY[sender]["passport_hash"],
-                signature_verified=True, encrypted=True,
+                signature_verified=False, encrypted=False,
                 payload_size=chunk_size, total_frame_size=chunk_size + overhead,
                 session_id=session_id,
                 trust_score=self._agent_trust(sender),
@@ -1721,7 +1721,7 @@ class AgentNetwork:
             sender_agent=sender, receiver_agent=receiver,
             direction="SENT", sequence=num_chunks + 2,
             passport_hash=AGENT_IDENTITY[sender]["passport_hash"],
-            signature_verified=True, encrypted=True,
+            signature_verified=False, encrypted=False,
             payload_size=64, total_frame_size=64 + overhead,
             session_id=session_id,
             trust_score=self._agent_trust(sender),
@@ -1758,7 +1758,7 @@ class AgentNetwork:
             sender_agent=sender, receiver_agent=receiver,
             direction="SENT", sequence=1,
             passport_hash=AGENT_IDENTITY[sender]["passport_hash"],
-            signature_verified=True, encrypted=True,
+            signature_verified=False, encrypted=False,
             payload_size=random.randint(512, 4096),
             total_frame_size=random.randint(512, 4096) + overhead,
             session_id=session_id,
@@ -1829,14 +1829,17 @@ class AgentNetwork:
     async def _run_bastion_demo(self, client: httpx.AsyncClient):
         """
         Run a supply chain demo via Bastion Protocol:
-        Producer → Compliance → Logistics → Buyer using encrypted binary frames.
+        Producer → Compliance → Logistics → Buyer using DIRECT mode +
+        trusted transport binary frames (authenticated at handshake via
+        X25519 ECDH + TOFU key pinning; NOT encrypted -- see AgentNetwork's
+        __init__ field comments for why that's correct for this ecosystem).
         """
         if not self._bastion_ready:
             # Fallback: generate demo frames directly into bastion_bus
             await self._generate_demo_bastion_frames()
             return
 
-        logger.info("BASTION: running encrypted supply chain demo...")
+        logger.info("BASTION: running authenticated supply chain demo (DIRECT mode, trusted transport)...")
 
         batch_id = f"BP-{secrets.token_hex(3).upper()}"
         batch = {
@@ -1853,7 +1856,7 @@ class AgentNetwork:
         await self._post_activity(
             client, "bastion_protocol",
             "ProducerBot", "ComplianceBot",
-            f"[BASTION] Encrypted batch {batch_id} sent for certification",
+            f"[BASTION] Batch {batch_id} sent for certification (DIRECT mode, authenticated)",
             status="active",
         )
 
@@ -1865,7 +1868,7 @@ class AgentNetwork:
             await self._post_activity(
                 client, "bastion_protocol",
                 "ComplianceBot", "ProducerBot",
-                f"[BASTION] Certification response received (encrypted binary)",
+                f"[BASTION] Certification response received (DIRECT mode, authenticated)",
             )
 
         await asyncio.sleep(random.uniform(2, 4))
@@ -1887,7 +1890,7 @@ class AgentNetwork:
             await self._post_activity(
                 client, "bastion_protocol",
                 "LogisticsBot", "ComplianceBot",
-                f"[BASTION] Shipping confirmation received (encrypted binary)",
+                f"[BASTION] Shipping confirmation received (DIRECT mode, authenticated)",
             )
 
         await asyncio.sleep(random.uniform(2, 4))
@@ -1909,7 +1912,7 @@ class AgentNetwork:
             await self._post_activity(
                 client, "bastion_protocol",
                 "BuyerBot", "LogisticsBot",
-                f"[BASTION] Full provenance verified via encrypted binary protocol",
+                f"[BASTION] Full provenance verified via DIRECT mode (authenticated binary protocol)",
             )
 
         logger.info(f"BASTION: supply chain demo complete for batch {batch_id}")
@@ -2179,7 +2182,7 @@ class AgentNetwork:
                             sender = random.choice(agents_list)
                             receiver = random.choice([a for a in agents_list if a != sender])
                             actions = [
-                                ("bastion_protocol", "[BASTION] Encrypted data frame sent"),
+                                ("bastion_protocol", "[BASTION] Authenticated data frame sent (DIRECT mode)"),
                                 ("verification", "Passport re-verification requested"),
                                 ("handoff", "Payload handoff initiated"),
                                 ("heartbeat", "Heartbeat — agent online"),
