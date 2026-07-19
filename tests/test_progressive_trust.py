@@ -10,15 +10,15 @@ Tests all 6 phases:
   F. Peer Reporting
 """
 import asyncio
-import hashlib
 import logging
 import os
 import secrets
 import sys
-import time
 
-# Ensure project root is on path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Ensure project root and SDK are on path
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, "sdk"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(name)-30s | %(levelname)-7s | %(message)s")
 logger = logging.getLogger("TrustPipelineTest")
@@ -80,11 +80,14 @@ async def test_phase_a_challenge_response():
         m2m_mod.REQUIRE_CHALLENGE = True
         transport = httpx.ASGITransport(app=app)
 
+        from lastbastion.crypto import generate_keypair, sign_bytes
+        pub_key, priv_key = generate_keypair()
+
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             # Register should return challenge, NOT api key
             resp = await client.post("/m2m/register", json={
                 "agent_id": "challenge-test-bot",
-                "public_key": secrets.token_hex(32),
+                "public_key": pub_key,
                 "role": "DATA_CONSUMER",
             })
             assert resp.status_code == 200
@@ -101,17 +104,14 @@ async def test_phase_a_challenge_response():
                 "signature": "bad_signature_000000",
             })
             assert bad_resp.status_code == 401, f"Expected 401, got {bad_resp.status_code}"
-            logger.info(f"  OK  Bad signature rejected: 401")
+            logger.info("  OK  Bad signature rejected: 401")
 
-            # Verify with correct HMAC fallback signature
-            expected_sig = hashlib.sha256(
-                (data["nonce"] + resp.json()["nonce"]).encode()  # This won't match; let's use proper construction
-            ).hexdigest()
-            # The fallback HMAC is sha256(nonce + public_key) — but we need the stored public_key
+            # Verify with a real Ed25519 signature of the nonce (the endpoint
+            # verifies via nacl VerifyKey.verify() -- there is no HMAC/SHA256
+            # fallback path, so the signature must come from the actual
+            # private key paired with the public key we registered above)
             ch = get_registration_challenge(data["challenge_id"])
-            correct_sig = hashlib.sha256(
-                (ch["nonce"] + ch["public_key"]).encode()
-            ).hexdigest()
+            correct_sig = sign_bytes(ch["nonce"].encode(), priv_key)
             good_resp = await client.post("/m2m/register/verify", json={
                 "challenge_id": data["challenge_id"],
                 "signature": correct_sig,
@@ -143,11 +143,7 @@ async def test_phase_b_trust_gating():
         import httpx
         from regional_core import app
         import core.m2m_router as m2m_mod
-        from core.database import (
-            save_agent_verification, update_agent_verification,
-            SessionLocal, AgentVerification,
-        )
-        from protocols.auth import M2MAuthenticator
+        from core.database import save_agent_verification, update_agent_verification
 
         m2m_mod.REQUIRE_CHALLENGE = False
         transport = httpx.ASGITransport(app=app)
@@ -174,7 +170,7 @@ async def test_phase_b_trust_gating():
                 "source_agent_id": "low-trust-bot",
             }, headers=headers)
             assert resp.status_code == 403, f"Expected 403, got {resp.status_code}: {resp.text[:200]}"
-            logger.info(f"  OK  Refinery submit blocked for trust=0.30: 403")
+            logger.info("  OK  Refinery submit blocked for trust=0.30: 403")
 
             # Try m2m/submit — should be 403 (requires BASIC = 0.55)
             # First get a quote
@@ -184,7 +180,7 @@ async def test_phase_b_trust_gating():
             }, headers=headers)
             # Quote should work (ANY_KEY)
             assert quote_resp.status_code == 200, f"Quote should work: {quote_resp.status_code}"
-            logger.info(f"  OK  Quote works at trust=0.30 (no trust gate)")
+            logger.info("  OK  Quote works at trust=0.30 (no trust gate)")
 
             quote_id = quote_resp.json()["quote"]["quote_id"]
             submit_resp = await client.post("/m2m/submit", json={
@@ -193,7 +189,7 @@ async def test_phase_b_trust_gating():
                 "payload": {"test": "data"},
             }, headers=headers)
             assert submit_resp.status_code == 403, f"Expected 403, got {submit_resp.status_code}"
-            logger.info(f"  OK  M2M submit blocked for trust=0.30: 403 (requires BASIC)")
+            logger.info("  OK  M2M submit blocked for trust=0.30: 403 (requires BASIC)")
 
             # Upgrade trust to 0.55 (BASIC)
             update_agent_verification(verification_id=avr.id, verdict="TRUSTED", trust_score=0.55)
@@ -221,8 +217,7 @@ async def test_phase_c_progressive_rate_limits():
     logger.info("=" * 60)
 
     from protocols.auth import (
-        M2MAuthenticator, TRUST_RATE_LIMITS, TRUST_THRESHOLDS,
-        _get_trust_level, RateLimiter,
+        TRUST_RATE_LIMITS, _get_trust_level, RateLimiter,
     )
 
     # Test 1: Trust level mapping
@@ -268,7 +263,6 @@ async def test_phase_d_sandbox_probation():
     from core.database import (
         get_agent_sandbox_graduation, save_sandbox_session,
         update_sandbox_session, save_sandbox_attack_result,
-        save_agent_verification, update_agent_verification,
         save_sandbox_organization, init_db,
     )
 
@@ -281,29 +275,35 @@ async def test_phase_d_sandbox_probation():
     logger.info(f"  OK  No sandbox → not graduated: passed={grad['passed']}")
 
     # Test 2: Create sandbox session with poor results → still not graduated
+    # (agent_id must be randomized like org_id/sess_id below -- graduation
+    # is "best score across all of this agent's sandbox sessions ever", so a
+    # hardcoded agent_id accumulates state across every re-run of this test
+    # against a real DB and eventually starts seeing a stale prior run's
+    # good score before this run's own "poor results" session even exists)
+    sandbox_agent_id = f"sandbox-test-agent-{secrets.token_hex(4)}"
     org_id = f"org-test-{secrets.token_hex(4)}"
     save_sandbox_organization(org_id=org_id, name="Test Org", email=f"test-{secrets.token_hex(4)}@test.com")
     sess_id = f"sess-{secrets.token_hex(4)}"
-    save_sandbox_session(session_id=sess_id, org_id=org_id, agent_id="sandbox-test-agent")
+    save_sandbox_session(session_id=sess_id, org_id=org_id, agent_id=sandbox_agent_id)
     # 1 passed, 3 failed = 0.25 resilience
     for attack in ["prompt_injection", "identity_spoofing", "sybil_flood"]:
-        save_sandbox_attack_result(session_id=sess_id, agent_id="sandbox-test-agent", attack_type=attack, passed=False)
-    save_sandbox_attack_result(session_id=sess_id, agent_id="sandbox-test-agent", attack_type="replay", passed=True)
+        save_sandbox_attack_result(session_id=sess_id, agent_id=sandbox_agent_id, attack_type=attack, passed=False)
+    save_sandbox_attack_result(session_id=sess_id, agent_id=sandbox_agent_id, attack_type="replay", passed=True)
     update_sandbox_session(sess_id, status="completed")
 
-    grad2 = get_agent_sandbox_graduation("sandbox-test-agent")
+    grad2 = get_agent_sandbox_graduation(sandbox_agent_id)
     assert not grad2["passed"], f"Should not pass with 0.25 resilience, got: {grad2}"
     logger.info(f"  OK  Low resilience (0.25) → not graduated: passed={grad2['passed']}")
 
     # Test 3: Create session with good results → graduated
     sess_id2 = f"sess-{secrets.token_hex(4)}"
-    save_sandbox_session(session_id=sess_id2, org_id=org_id, agent_id="sandbox-test-agent")
+    save_sandbox_session(session_id=sess_id2, org_id=org_id, agent_id=sandbox_agent_id)
     for attack in ["prompt_injection", "identity_spoofing", "sybil_flood", "replay"]:
-        save_sandbox_attack_result(session_id=sess_id2, agent_id="sandbox-test-agent", attack_type=attack, passed=True)
-    save_sandbox_attack_result(session_id=sess_id2, agent_id="sandbox-test-agent", attack_type="exfiltration", passed=False)
+        save_sandbox_attack_result(session_id=sess_id2, agent_id=sandbox_agent_id, attack_type=attack, passed=True)
+    save_sandbox_attack_result(session_id=sess_id2, agent_id=sandbox_agent_id, attack_type="exfiltration", passed=False)
     update_sandbox_session(sess_id2, status="completed")
 
-    grad3 = get_agent_sandbox_graduation("sandbox-test-agent")
+    grad3 = get_agent_sandbox_graduation(sandbox_agent_id)
     assert grad3["passed"], f"Should pass with 0.80 resilience, got: {grad3}"
     assert grad3["best_resilience_score"] >= 0.5
     logger.info(f"  OK  Good resilience ({grad3['best_resilience_score']}) → graduated: passed={grad3['passed']}")
@@ -333,7 +333,7 @@ async def test_phase_d_sandbox_probation():
             assert resp.status_code == 403, f"Should fail: {resp.status_code}"
             detail = resp.json().get("detail", {})
             assert "checklist" in detail or "message" in detail
-            logger.info(f"  OK  Upgrade blocked (requirements not met): 403")
+            logger.info("  OK  Upgrade blocked (requirements not met): 403")
 
         m2m_mod.REQUIRE_CHALLENGE = True
     except ImportError:
@@ -353,10 +353,9 @@ async def test_phase_e_trust_decay():
         save_agent_verification, update_agent_verification,
         apply_trust_decay, get_agent_trust,
         get_agent_rejection_rate, update_agent_last_active,
-        get_agents_for_decay, ensure_agent_verification_columns,
+        ensure_agent_verification_columns,
         init_db,
     )
-    from datetime import datetime
 
     init_db()
     ensure_agent_verification_columns()
@@ -384,6 +383,7 @@ async def test_phase_e_trust_decay():
 
     # Test 4: Decay below 0.40 should trigger live key revocation logic
     ok3 = apply_trust_decay(agent_id, 0.35, "Severe inactivity")
+    assert ok3, "apply_trust_decay should return True"
     trust2 = get_agent_trust(agent_id)
     assert trust2["trust_score"] < 0.40
     logger.info(f"  OK  Trust decayed below 0.40: {trust2['trust_score']:.2f}")
@@ -428,7 +428,7 @@ async def test_phase_f_peer_reporting():
     # Test 2: has_reported — prevents double-reporting
     assert has_reported("reporter-1", target_id), "Should detect existing report"
     assert not has_reported("reporter-2", target_id), "No report from reporter-2 yet"
-    logger.info(f"  OK  has_reported: reporter-1=True, reporter-2=False")
+    logger.info("  OK  has_reported: reporter-1=True, reporter-2=False")
 
     # Test 3: count_unique_reporters
     count = count_unique_reporters(target_id)
@@ -508,7 +508,7 @@ async def test_phase_f_peer_reporting():
                 "reason": "spam",
             }, headers=headers)
             assert self_resp.status_code == 400
-            logger.info(f"  OK  Self-report blocked: 400")
+            logger.info("  OK  Self-report blocked: 400")
 
             # Double-report should fail
             dup_resp = await client.post("/m2m/report-agent", json={
@@ -516,7 +516,7 @@ async def test_phase_f_peer_reporting():
                 "reason": "malicious_data",
             }, headers=headers)
             assert dup_resp.status_code == 409
-            logger.info(f"  OK  Double-report blocked: 409")
+            logger.info("  OK  Double-report blocked: 409")
 
         m2m_mod.REQUIRE_CHALLENGE = True
     except ImportError:

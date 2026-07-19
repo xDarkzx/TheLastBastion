@@ -20,8 +20,16 @@ import json
 import logging
 from datetime import datetime
 
+# This script lives in scripts/, but imports core.*/protocols.*/etc from the
+# project root -- without this, `python scripts/run_backend_test.py` (the
+# invocation documented in CLAUDE.md) fails with ModuleNotFoundError, since
+# Python only auto-adds the script's own directory (scripts/) to sys.path,
+# not the project root. `python -m scripts.run_backend_test` happens to work
+# around this by adding the cwd instead, but that's not the documented
+# command.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 # Structured logging — force UTF-8 on Windows to handle emoji/arrow chars
-import sys
 if sys.platform == "win32":
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
