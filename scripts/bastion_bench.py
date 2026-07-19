@@ -514,6 +514,11 @@ def main():
              "transport you control end-to-end (same host / private network segment). "
              "Must match the bench side's --trusted-transport setting.",
     )
+    p_serve.add_argument(
+        "--uvloop", dest="use_uvloop", action="store_true",
+        help="Use uvloop instead of the default asyncio event loop (Linux/Mac only). "
+             "Must match the bench side's --uvloop setting to be a fair comparison.",
+    )
 
     p_bench = sub.add_parser("bench", help="Run the sending side and measure everything")
     p_bench.add_argument("--host", required=True, help="Server host/IP (use the serve side's reachable address)")
@@ -531,12 +536,26 @@ def main():
              "transport you control end-to-end (same host / private network segment). "
              "Must match the serve side's --trusted-transport setting.",
     )
+    p_bench.add_argument(
+        "--uvloop", dest="use_uvloop", action="store_true",
+        help="Use uvloop instead of the default asyncio event loop (Linux/Mac only). "
+             "Must match the serve side's --uvloop setting to be a fair comparison.",
+    )
 
     args = parser.parse_args()
 
     if not _HAS_PSUTIL:
         print("Note: psutil not installed -- CPU/memory stats will be unavailable "
               "(pip install psutil). GPU stats need pynvml on top of that.")
+
+    if getattr(args, "use_uvloop", False):
+        try:
+            import uvloop
+            asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+            print("Using uvloop event loop policy.")
+        except ImportError:
+            print("WARNING: --uvloop requested but uvloop is not installed "
+                  "(pip install uvloop -- Linux/Mac only). Falling back to default asyncio.")
 
     if args.command == "serve":
         asyncio.run(cmd_serve(args))

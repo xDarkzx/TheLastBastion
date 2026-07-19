@@ -82,11 +82,14 @@ def _collect_environment() -> Dict[str, Any]:
 def _run_one_trial(
     trial_num: int, host: str, port: int, messages: int, bulk_messages: int,
     handshakes: int, size: int, report_path: str, trusted_transport: bool = False,
+    use_uvloop: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Launches a fresh server subprocess and a fresh client subprocess for one trial."""
     serve_cmd = [_PYTHON, os.path.join(_HERE, "bastion_bench.py"), "serve", "--port", str(port)]
     if trusted_transport:
         serve_cmd.append("--trusted-transport")
+    if use_uvloop:
+        serve_cmd.append("--uvloop")
     server_proc = subprocess.Popen(
         serve_cmd,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -103,6 +106,8 @@ def _run_one_trial(
         ]
         if trusted_transport:
             bench_cmd.append("--trusted-transport")
+        if use_uvloop:
+            bench_cmd.append("--uvloop")
         client_proc = subprocess.run(
             bench_cmd,
             capture_output=True, text=True, timeout=120,
@@ -159,12 +164,21 @@ def main():
         help="Benchmark the trusted_transport=True path (no NaCl encryption on DATA "
              "frames) instead of the default fully-encrypted path.",
     )
+    parser.add_argument(
+        "--uvloop", dest="use_uvloop", action="store_true",
+        help="Benchmark with uvloop instead of the default asyncio event loop "
+             "(Linux/Mac only -- both serve and bench subprocesses use it).",
+    )
     args = parser.parse_args()
 
     print(f"Rigorous benchmark: {args.trials} independent trials, fresh server+client process each")
     print(f"Environment: {platform.platform()}, Python {platform.python_version()}\n")
 
     env = _collect_environment()
+    env["trusted_transport"] = args.trusted_transport
+    env["use_uvloop"] = args.use_uvloop
+    if args.use_uvloop:
+        env["uvloop_version"] = _pkg_version("uvloop")
     trials: List[Dict[str, Any]] = []
     failed = 0
 
@@ -173,7 +187,7 @@ def main():
         report_path = os.path.join(_HERE, f".rigorous_trial_{i}.json")
         result = _run_one_trial(
             i + 1, args.host, args.port + (i % 50), args.messages, args.bulk_messages,
-            args.handshakes, args.size, report_path, args.trusted_transport,
+            args.handshakes, args.size, report_path, args.trusted_transport, args.use_uvloop,
         )
         if result is None:
             failed += 1

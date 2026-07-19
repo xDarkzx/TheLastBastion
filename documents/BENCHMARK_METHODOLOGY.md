@@ -16,9 +16,13 @@ you control end-to-end, see `sdk/lastbastion/protocol/socket.py`'s
 - [`BENCHMARK_RESULTS_WINDOWS_TRUSTED.md`](BENCHMARK_RESULTS_WINDOWS_TRUSTED.md) — 10 independent trials, Windows 10
 - [`BENCHMARK_RESULTS_LINUX_WSL2_TRUSTED.md`](BENCHMARK_RESULTS_LINUX_WSL2_TRUSTED.md) — 10 independent trials, WSL2 Ubuntu 22.04
 
-All four were produced by the same tool (`scripts/rigorous_bench.py`, which
+`trusted_transport=True` + `uvloop` (Linux/Mac only):
+- [`BENCHMARK_RESULTS_LINUX_WSL2_TRUSTED_UVLOOP.md`](BENCHMARK_RESULTS_LINUX_WSL2_TRUSTED_UVLOOP.md) — 10 independent trials, WSL2 Ubuntu 22.04
+
+All five were produced by the same tool (`scripts/rigorous_bench.py`, which
 drives `scripts/bastion_bench.py`) with identical parameters (only
-`--trusted-transport` differs), so all four reports are directly comparable.
+`--trusted-transport`/`--uvloop` differ), so all five reports are directly
+comparable.
 
 ## How this differs from an ad-hoc benchmark run
 
@@ -125,3 +129,34 @@ no longer the dominant cost. There is a real, marginal amount of headroom
 left in flattening the call chain and reducing per-frame dataclass
 construction, but based on the profiling above that would close single-digit
 percentage points, not the remaining multiple-x gap to parity.
+
+### uvloop — tested, and it made the ratio WORSE, not better
+
+An external assessment of this codebase hypothesized `uvloop` (a faster
+C-accelerated asyncio event loop, unused anywhere in this project until
+this test) as the highest-leverage untested lever for closing the gap,
+based on general public benchmarks showing 2.6-5.5x more event-loop
+throughput. That hypothesis was tested directly, not assumed: `--uvloop`
+support was added to `scripts/bastion_bench.py`/`rigorous_bench.py`, and
+the full 10-trial methodology was re-run on Linux/WSL2 with
+`trusted_transport=True` + `uvloop` together (the best-case configuration).
+
+Result: **the round-trip ratio got worse (0.28x → 0.19x), and pipelined
+stayed flat (0.34x → 0.29x)** -- both statistically solid across 10 trials,
+not noise. What happened: uvloop genuinely sped up raw socket I/O for
+*both* protocols (JSON's round-trip throughput jumped 50%, from 29,051 to
+43,628 msg/s), but Bastion's own frame-processing overhead (struct
+packing, sequence/freshness checks, the encode/decode call chain --
+already identified above as the dominant remaining cost) didn't shrink at
+all, since none of that is I/O. When the shared I/O layer both protocols
+sit on top of gets faster, JSON -- which does almost nothing else -- gets
+proportionally faster too, while Bastion's fixed processing overhead
+becomes a *larger* share of its total time. A faster event loop helps the
+side with less non-I/O work more, not less.
+
+This is the honest, measured answer, not the plausible-sounding one: uvloop
+is not the lever that closes this gap, and adopting it wouldn't have been
+worth the Linux-only platform constraint it introduces. The bottleneck
+really is Bastion's own protocol-processing code, exactly as the
+side-by-side cProfile comparison above already showed -- this result is
+consistent with that finding, not a contradiction of it.
