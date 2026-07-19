@@ -684,7 +684,7 @@ const BastionProtocolView = ({ bastionData, protocolLog }) => {
                         {
                             num: 4,
                             label: 'Session Established',
-                            detail: `XSalsa20-Poly1305 cipher active, session ${sid}${helloAck?.latency_ms ? `, latency ${helloAck.latency_ms.toFixed(1)}ms` : ''}`,
+                            detail: `${data && !data.encrypted ? 'Trusted transport (no encryption — identity already proven at handshake)' : 'XSalsa20-Poly1305 cipher active'}, session ${sid}${helloAck?.latency_ms ? `, latency ${helloAck.latency_ms.toFixed(1)}ms` : ''}`,
                             color: 'border-slate-400 bg-slate-100',
                             dotColor: 'bg-slate-700',
                         },
@@ -693,8 +693,8 @@ const BastionProtocolView = ({ bastionData, protocolLog }) => {
                     if (data) {
                         steps.push({
                             num: 5,
-                            label: 'Encrypted Payload',
-                            detail: data.payload_description || `Data sent (${formatBytes(data.payload_size || 0)} ${data.payload_encoding || 'msgpack'}, encrypted)`,
+                            label: data.encrypted ? 'Encrypted Payload' : 'Authenticated Payload (unencrypted)',
+                            detail: data.payload_description || `Data sent (${formatBytes(data.payload_size || 0)} ${data.payload_encoding || 'msgpack'}${data.encrypted ? ', encrypted' : ', trusted transport'})`,
                             color: 'border-slate-300 bg-slate-50',
                             dotColor: 'bg-slate-600',
                         });
@@ -704,7 +704,9 @@ const BastionProtocolView = ({ bastionData, protocolLog }) => {
                         steps.push({
                             num: 6,
                             label: 'Acknowledged',
-                            detail: `${receiverLabel} verifies MAC, sends DATA_ACK — payload accepted`,
+                            detail: data?.encrypted
+                                ? `${receiverLabel} verifies MAC, sends DATA_ACK — payload accepted`
+                                : `${receiverLabel} sends DATA_ACK — payload accepted`,
                             color: 'border-slate-400 bg-slate-100',
                             dotColor: 'bg-slate-700',
                         });
