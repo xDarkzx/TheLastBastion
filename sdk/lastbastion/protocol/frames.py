@@ -292,9 +292,30 @@ def serialize_payload(data: dict) -> bytes:
     return msgpack.packb(data, use_bin_type=True)
 
 
+# Explicit, conservative sanity ceilings for msgpack.unpackb, applied to
+# every payload including HELLO/RESUME -- called on attacker-controlled
+# bytes before any authentication in DIRECT mode (the claimed public key
+# needed to verify a HELLO's signature is itself inside the payload being
+# parsed, so parsing necessarily happens first). Container-count limits
+# (max_array_len/max_map_len) matter independently of the byte-size cap
+# already enforced by MAX_FRAME_SIZE: a small number of bytes can still
+# declare a very large number of nested empty containers, forcing many
+# Python object allocations relative to bytes actually received. String/
+# bin limits are set to MAX_FRAME_SIZE since no single value can exceed the
+# frame anyway -- these aren't meant to constrain legitimate payloads.
+_MSGPACK_MAX_ARRAY_LEN = 100_000
+_MSGPACK_MAX_MAP_LEN = 100_000
+
+
 def deserialize_payload(data: bytes) -> dict:
-    """Deserialize bytes to dict using MessagePack."""
-    return msgpack.unpackb(data, raw=False)
+    """Deserialize bytes to dict using MessagePack, with explicit bounds."""
+    return msgpack.unpackb(
+        data, raw=False,
+        max_array_len=_MSGPACK_MAX_ARRAY_LEN,
+        max_map_len=_MSGPACK_MAX_MAP_LEN,
+        max_str_len=MAX_FRAME_SIZE,
+        max_bin_len=MAX_FRAME_SIZE,
+    )
 
 
 # ---------------------------------------------------------------------------
