@@ -101,6 +101,15 @@ class NonceRegistry:
             self._redis.ping()
         except Exception:
             self._redis = None  # Fall back to in-memory (single-process only)
+            logging.getLogger("BastionNonceRegistry").warning(
+                "NonceRegistry: Redis unavailable, falling back to in-memory "
+                "replay tracking -- a nonce/ticket seen by this process is "
+                "invisible to any other worker process or replica. Replay "
+                "protection silently stops working across process boundaries "
+                "until Redis is reachable. Fine for a single-process "
+                "deployment; not fine behind more than one uvicorn worker "
+                "or multiple replicas."
+            )
 
     def check_and_record(self, nonce: bytes) -> bool:
         """Returns True if nonce is fresh (not seen before). Records it.

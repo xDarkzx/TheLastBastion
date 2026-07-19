@@ -167,6 +167,40 @@ def test_direct_mode_revoked_peer_rejected():
     assert raised, "a revoked peer must be rejected even with a correct key"
 
 
+def test_trust_store_revocation_propagates_across_process_boundary():
+    """
+    Regression test: PeerTrustStore loaded its pins once at __init__ and
+    never re-read the file, so revoke() called by one process (or one
+    PeerTrustStore instance sharing the same on-disk file with another --
+    a real deployment shape: multiple workers, or a server process plus a
+    separate revocation-check process) was invisible to any OTHER instance
+    already holding that file open until it restarted. A revoked peer
+    stayed trusted indefinitely on every instance that didn't independently
+    restart. Simulates two processes by constructing two separate
+    PeerTrustStore objects against the SAME file path.
+    """
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "shared.json")
+
+    store_process_a = PeerTrustStore(path)
+    store_process_b = PeerTrustStore(path)
+
+    pub, _priv = generate_keypair()
+    store_process_a.pin("agent-x", pub)
+
+    # process_b doesn't know about the pin yet (loaded before process_a wrote
+    # it) -- but a read should pick it up via the mtime-based reload.
+    assert store_process_b.get_pinned("agent-x") == pub
+
+    # process_b revokes -- process_a (a DIFFERENT in-memory instance) must
+    # see the revocation on its next check, not just on-disk.
+    assert store_process_b.revoke("agent-x") is True
+    assert store_process_a.get_pinned("agent-x") is None, (
+        "a revocation from a different process/instance sharing the same "
+        "trust-store file must be visible here, not just on disk"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Session Resumption
 # ---------------------------------------------------------------------------

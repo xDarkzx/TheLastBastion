@@ -64,6 +64,7 @@ class PeerTrustStore:
         self._path = path
         self._lock = threading.Lock()
         self._pins: Dict[str, dict] = {}  # agent_id -> {public_key, pinned_at, revoked}
+        self._mtime: float = 0.0
         self._load()
 
     def _load(self) -> None:
@@ -72,9 +73,31 @@ class PeerTrustStore:
         try:
             with open(self._path) as f:
                 self._pins = json.load(f)
+            self._mtime = os.path.getmtime(self._path)
         except Exception as e:
             logger.warning(f"Could not load trust store {self._path}: {e}")
             self._pins = {}
+
+    def _reload_if_changed(self) -> None:
+        """
+        Re-reads the store from disk if another process has modified it
+        since this instance last loaded. Caller must hold self._lock.
+
+        Without this, a revoke() or pin() from a different process sharing
+        the same trust-store file (a real, likely deployment shape --
+        multiple uvicorn workers, or a server process and a separate
+        resumption/revocation-check process) is invisible to this instance
+        until it restarts. A revoked peer stays trusted here indefinitely.
+        This only checks mtime, not content -- cheap (one stat syscall) on
+        every trust decision, full re-read only when the file actually
+        changed.
+        """
+        try:
+            current_mtime = os.path.getmtime(self._path) if os.path.exists(self._path) else 0.0
+        except OSError:
+            return
+        if current_mtime != self._mtime:
+            self._load()
 
     def _save(self) -> None:
         parent = os.path.dirname(self._path)
@@ -83,12 +106,14 @@ class PeerTrustStore:
         try:
             with open(self._path, "w") as f:
                 json.dump(self._pins, f, indent=2)
+            self._mtime = os.path.getmtime(self._path)
         except Exception as e:
             logger.error(f"Could not persist trust store {self._path}: {e}")
 
     def pin(self, agent_id: str, public_key: str) -> None:
         """Explicitly pin a peer's public key (e.g. learned via an A2A Agent Card)."""
         with self._lock:
+            self._reload_if_changed()
             self._pins[agent_id] = {
                 "public_key": public_key,
                 "pinned_at": time.time(),
@@ -100,6 +125,7 @@ class PeerTrustStore:
     def revoke(self, agent_id: str) -> bool:
         """Marks a pinned peer as revoked — DIRECT mode connections from it are rejected."""
         with self._lock:
+            self._reload_if_changed()  # don't clobber a pin another process just added
             if agent_id not in self._pins:
                 return False
             self._pins[agent_id]["revoked"] = True
@@ -109,6 +135,7 @@ class PeerTrustStore:
 
     def get_pinned(self, agent_id: str) -> Optional[str]:
         with self._lock:
+            self._reload_if_changed()
             entry = self._pins.get(agent_id)
             return entry["public_key"] if entry and not entry.get("revoked") else None
 
@@ -128,6 +155,7 @@ class PeerTrustStore:
         - Existing pin, revoked        -> rejected.
         """
         with self._lock:
+            self._reload_if_changed()  # a revoke() from another process must take effect here
             entry = self._pins.get(agent_id)
 
             if entry is None:
