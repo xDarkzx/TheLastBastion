@@ -201,6 +201,27 @@ class AgentConnection:
     def is_closed(self) -> bool:
         return self._closed
 
+    @staticmethod
+    def _safe_deserialize(payload: bytes) -> dict:
+        """
+        deserialize_payload() on raw wire bytes from a peer -- in
+        trusted_transport=True mode specifically, there's no decryption/MAC
+        step to reject a tampered or malformed payload first, so any peer
+        that completed a valid handshake can trigger a msgpack parse
+        failure just by sending garbage as a DATA payload. Every docstring
+        in this class that shows error handling only shows catching
+        ConnectionError; deserialize_payload() used to be called unguarded,
+        so a malformed payload raised a raw msgpack exception (or bare
+        ValueError) instead -- a caller following the documented pattern
+        would not catch it. Normalized to ConnectionError here, with the
+        original preserved as __cause__ for anyone who does want to
+        distinguish "peer sent garbage" from other connection failures.
+        """
+        try:
+            return deserialize_payload(payload)
+        except Exception as e:
+            raise ConnectionError(f"Malformed payload from peer: {e}") from e
+
     async def send(self, data: dict) -> None:
         """Send a DATA frame with a dict payload."""
         if self._closed:
@@ -213,7 +234,7 @@ class AgentConnection:
         while True:
             frame = await self._read_frame()
             if frame.msg_type == FrameType.DATA:
-                return deserialize_payload(frame.payload)
+                return self._safe_deserialize(frame.payload)
             elif frame.msg_type == FrameType.PING:
                 await self._send_pong()
             elif frame.msg_type == FrameType.PONG:
@@ -229,7 +250,7 @@ class AgentConnection:
                 raise ConnectionError("Peer closed connection")
             elif frame.msg_type == FrameType.ERROR:
                 self.metrics.errors += 1
-                error_data = deserialize_payload(frame.payload)
+                error_data = self._safe_deserialize(frame.payload)
                 raise ConnectionError(
                     f"Peer error {error_data.get('code', '?')}: "
                     f"{error_data.get('message', 'unknown')}"
@@ -315,21 +336,38 @@ class AgentConnection:
             if frame.msg_type != FrameType.STREAM_START:
                 raise ConnectionError(f"Expected STREAM_START, got 0x{frame.msg_type:02x}")
 
-            start_data = deserialize_payload(frame.payload)
-            stream_id = start_data["stream_id"]
-            if isinstance(stream_id, list):
-                stream_id = bytes(stream_id)
-            expected_chunks = start_data["chunk_count"]
-            expected_hash = start_data["content_hash"]
-            total_size = start_data.get("total_size", 0)
-            if isinstance(expected_hash, list):
-                expected_hash = bytes(expected_hash)
+            start_data = self._safe_deserialize(frame.payload)
+            try:
+                stream_id = start_data["stream_id"]
+                if isinstance(stream_id, list):
+                    stream_id = bytes(stream_id)
+                expected_chunks = start_data["chunk_count"]
+                expected_hash = start_data["content_hash"]
+                total_size = start_data.get("total_size", 0)
+                if isinstance(expected_hash, list):
+                    expected_hash = bytes(expected_hash)
+            except (KeyError, TypeError) as e:
+                raise ConnectionError(f"Malformed STREAM_START from peer: missing/invalid field: {e}") from e
 
             # Enforce stream size cap
             if total_size > self._max_stream_size:
                 raise ConnectionError(
                     f"Stream too large: {total_size} bytes "
                     f"(max {self._max_stream_size})"
+                )
+
+            # chunk_count was never validated against total_size -- a peer
+            # could claim a tiny total_size (passing the check above) paired
+            # with an enormous chunk_count, forcing `[None] * expected_chunks`
+            # below to allocate a huge list immediately, before a single
+            # byte of the (small, legitimate-looking) stream has even
+            # arrived. No legitimate sender emits more chunks than bytes
+            # (minimum 1 byte/chunk), so total_size + 1 is a hard ceiling no
+            # honest peer can exceed, not a real constraint on chunk_size.
+            if not isinstance(expected_chunks, int) or not (0 <= expected_chunks <= total_size + 1):
+                raise ConnectionError(
+                    f"Implausible chunk_count {expected_chunks!r} for a "
+                    f"{total_size}-byte stream"
                 )
 
             # Receive chunks
@@ -343,29 +381,39 @@ class AgentConnection:
                     chunk_frame = await self._read_frame_raw()
                 if chunk_frame.msg_type != FrameType.STREAM_CHUNK:
                     raise ConnectionError(f"Expected STREAM_CHUNK, got 0x{chunk_frame.msg_type:02x}")
-                chunk_data = deserialize_payload(chunk_frame.payload)
-                chunk_stream_id = chunk_data["stream_id"]
-                if isinstance(chunk_stream_id, list):
-                    chunk_stream_id = bytes(chunk_stream_id)
+                chunk_data = self._safe_deserialize(chunk_frame.payload)
+                try:
+                    chunk_stream_id = chunk_data["stream_id"]
+                    if isinstance(chunk_stream_id, list):
+                        chunk_stream_id = bytes(chunk_stream_id)
+                    idx = chunk_data["chunk_index"]
+                    chunk_bytes = chunk_data["data"]
+                    if isinstance(chunk_bytes, list):
+                        chunk_bytes = bytes(chunk_bytes)
+                except (KeyError, TypeError) as e:
+                    raise ConnectionError(f"Malformed STREAM_CHUNK from peer: missing/invalid field: {e}") from e
                 if chunk_stream_id != stream_id:
                     raise ConnectionError(
                         f"STREAM_CHUNK belongs to a different stream "
                         f"({chunk_stream_id.hex()} != {stream_id.hex()})"
                     )
-                idx = chunk_data["chunk_index"]
-                chunk_bytes = chunk_data["data"]
-                if isinstance(chunk_bytes, list):
-                    chunk_bytes = bytes(chunk_bytes)
+                if not (0 <= idx < len(chunks)):
+                    raise ConnectionError(
+                        f"STREAM_CHUNK index {idx} out of range for {len(chunks)}-chunk stream"
+                    )
                 chunks[idx] = chunk_bytes
 
             # Wait for STREAM_END
             end_frame = await self._read_frame_raw()
             if end_frame.msg_type != FrameType.STREAM_END:
                 raise ConnectionError(f"Expected STREAM_END, got 0x{end_frame.msg_type:02x}")
-            end_data = deserialize_payload(end_frame.payload)
-            end_stream_id = end_data["stream_id"]
-            if isinstance(end_stream_id, list):
-                end_stream_id = bytes(end_stream_id)
+            end_data = self._safe_deserialize(end_frame.payload)
+            try:
+                end_stream_id = end_data["stream_id"]
+                if isinstance(end_stream_id, list):
+                    end_stream_id = bytes(end_stream_id)
+            except (KeyError, TypeError) as e:
+                raise ConnectionError(f"Malformed STREAM_END from peer: missing/invalid field: {e}") from e
             if end_stream_id != stream_id:
                 raise ConnectionError(
                     f"STREAM_END belongs to a different stream "

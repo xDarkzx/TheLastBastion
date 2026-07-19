@@ -407,6 +407,77 @@ def test_resumption_revocation_callback_rejects_session():
 # DirectAgentSocket -- real over-the-wire TCP tests (not just in-process crypto)
 # ---------------------------------------------------------------------------
 
+def test_socket_malformed_data_payload_raises_connection_error():
+    """
+    Regression test: recv() called deserialize_payload() unguarded, so a
+    peer sending a structurally-valid DATA frame with a payload that isn't
+    valid msgpack raised a raw msgpack exception (or bare ValueError)
+    instead of ConnectionError -- every docstring in AgentConnection only
+    documents catching ConnectionError, so a caller following that pattern
+    would not catch this. In trusted_transport=True mode there's no
+    decryption/MAC step to reject a tampered payload first, so any peer
+    that completed a valid handshake can trigger this just by sending
+    garbage bytes as a DATA payload.
+
+    Directly constructs a DATA frame with a non-msgpack payload and drives
+    AgentConnection.recv()'s dispatch logic via the real FrameDecoder, not
+    a mock, to prove the actual code path raises the right type.
+    """
+    async def run():
+        d = tempfile.mkdtemp()
+        store_client = PeerTrustStore(os.path.join(d, "client.json"))
+        store_server = PeerTrustStore(os.path.join(d, "server.json"))
+        pub_c, priv_c = generate_keypair()
+        pub_s, priv_s = generate_keypair()
+
+        server_saw_error = []
+
+        async def handle(conn):
+            try:
+                await conn.recv()
+            except ConnectionError:
+                server_saw_error.append("ConnectionError")
+            except Exception as e:
+                server_saw_error.append(type(e).__name__)
+            await conn.close()
+
+        server = DirectAgentSocket.listen(
+            agent_id="server-agent", public_key=pub_s, signing_key=priv_s,
+            trust_store=store_server, port=19317, trusted_transport=True,
+        )
+        server.on_connect(handle)
+        await server.start_background()
+        await asyncio.sleep(0.1)
+
+        try:
+            conn, _t, _s = await DirectAgentSocket.connect(
+                "localhost", agent_id="client-agent", public_key=pub_c,
+                signing_key=priv_c, trust_store=store_client, port=19317,
+                trusted_transport=True,
+            )
+            # Send a structurally-valid DATA frame whose payload is NOT
+            # valid msgpack -- bypasses conn.send()'s normal
+            # serialize_payload() call to inject genuinely malformed bytes,
+            # exactly what an adversarial peer would do.
+            bad_frame = conn._encoder.encode_data(
+                {"placeholder": True}, conn._encrypt_func,
+            )
+            bad_frame.payload = b"\xff\xff\xff not valid msgpack \x00\x01"
+            async with conn._send_lock:
+                await conn._write_frame_raw(bad_frame)
+            await asyncio.sleep(0.3)
+            await conn.close()
+        finally:
+            await server.stop()
+
+        assert server_saw_error == ["ConnectionError"], (
+            f"expected the server's recv() to raise ConnectionError for a "
+            f"malformed payload, got: {server_saw_error}"
+        )
+
+    asyncio.run(run())
+
+
 def test_socket_fresh_handshake_and_data_exchange():
     async def run():
         d = tempfile.mkdtemp()
