@@ -6,12 +6,19 @@ index for two full benchmark reports and the tool that produced them.
 
 ## Reports
 
+Fully-encrypted DIRECT mode (default: NaCl SecretBox encryption on every DATA frame):
 - [`BENCHMARK_RESULTS_WINDOWS.md`](BENCHMARK_RESULTS_WINDOWS.md) — 10 independent trials, Windows 10
 - [`BENCHMARK_RESULTS_LINUX_WSL2.md`](BENCHMARK_RESULTS_LINUX_WSL2.md) — 10 independent trials, WSL2 Ubuntu 22.04 (Linux kernel)
 
-Both were produced by the same tool (`scripts/rigorous_bench.py`, which
-drives `scripts/bastion_bench.py`) with identical parameters, so the two
-reports are directly comparable to each other.
+`trusted_transport=True` (no encryption — only appropriate for a connection
+you control end-to-end, see `sdk/lastbastion/protocol/socket.py`'s
+`AgentConnection` docstring):
+- [`BENCHMARK_RESULTS_WINDOWS_TRUSTED.md`](BENCHMARK_RESULTS_WINDOWS_TRUSTED.md) — 10 independent trials, Windows 10
+- [`BENCHMARK_RESULTS_LINUX_WSL2_TRUSTED.md`](BENCHMARK_RESULTS_LINUX_WSL2_TRUSTED.md) — 10 independent trials, WSL2 Ubuntu 22.04
+
+All four were produced by the same tool (`scripts/rigorous_bench.py`, which
+drives `scripts/bastion_bench.py`) with identical parameters (only
+`--trusted-transport` differs), so all four reports are directly comparable.
 
 ## How this differs from an ad-hoc benchmark run
 
@@ -65,12 +72,12 @@ exists only to answer "what does the crypto and framing cost, concretely."
 ## Honest summary of findings (as of these runs)
 
 Bastion Protocol is **slower than plain JSON** on both platforms, on both
-patterns tested:
+patterns tested, in both configurations:
 
-| Pattern | Windows | Linux (WSL2) |
-|---|---|---|
-| Round-trip throughput ratio (Bastion / JSON) | 0.45x | 0.22x |
-| Pipelined bulk-send ratio (Bastion / JSON) | 0.22x | 0.21x |
+| Pattern | Windows (encrypted) | Windows (trusted_transport) | Linux (encrypted) | Linux (trusted_transport) |
+|---|---|---|---|---|
+| Round-trip throughput ratio (Bastion / JSON) | 0.45x | 0.62x | 0.22x | 0.28x |
+| Pipelined bulk-send ratio (Bastion / JSON) | 0.22x | 0.29x | 0.21x | 0.34x |
 
 This is not parity, and no claim of parity or improvement is made anywhere
 in this repository. Session resumption (skipping a full handshake on
@@ -78,11 +85,43 @@ reconnect) does show a real, repeatedly-measured ~1.9–2.1x speedup over a
 fresh handshake on both platforms — that is a genuine, narrower win, not a
 substitute for the round-trip/pipelined numbers above.
 
-The gap is attributable to the actual cost of Ed25519 signing, X25519 ECDH,
-and NaCl SecretBox encrypt/decrypt per message, plus msgpack framing versus
-Python's C-accelerated `json` module — costs plain JSON-over-TCP does not
-pay because it does none of that work. Closing this gap, if it's worth
-closing, requires either reducing per-message crypto operations (e.g.
-batching, or amortizing signature cost across a session rather than
-per-frame) or accepting that a secure protocol will not be as fast as an
-insecure one and choosing where that tradeoff is acceptable.
+**Removing encryption (`trusted_transport=True`) closes part of the gap,
+consistently, on both platforms — but not most of it.** Round-trip
+improved 38% on Windows (0.45x → 0.62x) and 27% on Linux (0.22x → 0.28x);
+pipelined improved similarly. That's a real, repeatable, statistically
+solid result (see the `_TRUSTED` reports above for full trial data) — and
+it is nowhere near "as fast as JSON."
+
+### Where the remaining gap actually is (profiled, not guessed)
+
+After encryption is removed, isolated CPU-only microbenchmarks of just the
+encode/decode path (msgpack pack/unpack, frame header struct.pack/unpack,
+sequence/freshness validation) showed costs small enough that they didn't
+explain the observed throughput gap on their own — so rather than trust
+that estimate, the actual live round-trip path was profiled directly with
+`cProfile` against a real running server, and compared line-for-line against
+an identically-profiled JSON baseline over the same connection pattern.
+
+Result: **both protocols pay nearly identical raw socket I/O cost** — same
+number of `WSASend`/`WSARecvInto`/event-loop-poll calls, since both use the
+same length-prefixed read/write pattern. The gap comes from Bastion's own
+structural overhead on top of that shared I/O cost: frame header
+packing/unpacking (`struct.pack`/`struct.unpack`), sequence-number and
+freshness/timestamp validation, and the extra Python-level call chain
+(`send()` → `_write_frame()` → `_write_frame_raw()`, and the equivalent on
+the read side) versus JSON's flatter, more direct `writer.write()` /
+`reader.readexactly()` calls. None of this is wasted computation --
+it's what a binary framed protocol with replay/freshness protection
+actually costs beyond a bare socket write, and msgpack itself is faster
+than `json` in isolation (measured ~0.74us vs ~3.53us per message for
+pack+unpack combined) — the serialization format was never the problem.
+
+**What this means practically:** closing the remaining gap further would
+require removing more of what makes this a real protocol -- sequence
+numbers (replay protection), timestamps (freshness/replay-window
+enforcement), or the structured typed-frame header (versioning,
+parseability) -- not more crypto or serialization tuning, since those are
+no longer the dominant cost. There is a real, marginal amount of headroom
+left in flattening the call chain and reducing per-frame dataclass
+construction, but based on the profiling above that would close single-digit
+percentage points, not the remaining multiple-x gap to parity.

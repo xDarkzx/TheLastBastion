@@ -81,24 +81,30 @@ def _collect_environment() -> Dict[str, Any]:
 
 def _run_one_trial(
     trial_num: int, host: str, port: int, messages: int, bulk_messages: int,
-    handshakes: int, size: int, report_path: str,
+    handshakes: int, size: int, report_path: str, trusted_transport: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Launches a fresh server subprocess and a fresh client subprocess for one trial."""
+    serve_cmd = [_PYTHON, os.path.join(_HERE, "bastion_bench.py"), "serve", "--port", str(port)]
+    if trusted_transport:
+        serve_cmd.append("--trusted-transport")
     server_proc = subprocess.Popen(
-        [_PYTHON, os.path.join(_HERE, "bastion_bench.py"), "serve", "--port", str(port)],
+        serve_cmd,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     try:
         time.sleep(1.2)  # let the server bind and start accepting
 
+        bench_cmd = [
+            _PYTHON, os.path.join(_HERE, "bastion_bench.py"), "bench",
+            "--host", host, "--port", str(port),
+            "--handshakes", str(handshakes), "--messages", str(messages),
+            "--bulk-messages", str(bulk_messages), "--size", str(size),
+            "--report", report_path,
+        ]
+        if trusted_transport:
+            bench_cmd.append("--trusted-transport")
         client_proc = subprocess.run(
-            [
-                _PYTHON, os.path.join(_HERE, "bastion_bench.py"), "bench",
-                "--host", host, "--port", str(port),
-                "--handshakes", str(handshakes), "--messages", str(messages),
-                "--bulk-messages", str(bulk_messages), "--size", str(size),
-                "--report", report_path,
-            ],
+            bench_cmd,
             capture_output=True, text=True, timeout=120,
         )
         if client_proc.returncode != 0:
@@ -148,6 +154,11 @@ def main():
     parser.add_argument("--bulk-messages", type=int, default=20000)
     parser.add_argument("--size", type=int, default=512)
     parser.add_argument("--output", default="BENCHMARK_RESULTS.md")
+    parser.add_argument(
+        "--trusted-transport", dest="trusted_transport", action="store_true",
+        help="Benchmark the trusted_transport=True path (no NaCl encryption on DATA "
+             "frames) instead of the default fully-encrypted path.",
+    )
     args = parser.parse_args()
 
     print(f"Rigorous benchmark: {args.trials} independent trials, fresh server+client process each")
@@ -162,7 +173,7 @@ def main():
         report_path = os.path.join(_HERE, f".rigorous_trial_{i}.json")
         result = _run_one_trial(
             i + 1, args.host, args.port + (i % 50), args.messages, args.bulk_messages,
-            args.handshakes, args.size, report_path,
+            args.handshakes, args.size, report_path, args.trusted_transport,
         )
         if result is None:
             failed += 1
