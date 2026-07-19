@@ -223,10 +223,26 @@ class AgentConnection:
             raise ConnectionError(f"Malformed payload from peer: {e}") from e
 
     async def send(self, data: dict) -> None:
-        """Send a DATA frame with a dict payload."""
+        """Send a DATA frame with a dict payload.
+
+        Raises ConnectionError if the connection is closed, or if this
+        connection's sequence number has been exhausted (2^32-1 frames --
+        reachable in ~50 days of continuous traffic at 1000 msg/s on one
+        long-lived connection). The latter used to raise a bare
+        OverflowError, which every documented error-handling pattern in
+        this class (catch ConnectionError) would not catch -- a
+        reconnect is required either way, so it's normalized to the same
+        type as every other "this connection is no longer usable" case.
+        """
         if self._closed:
             raise ConnectionError("Connection is closed")
-        frame = self._encoder.encode_data(data, self._encrypt_func)
+        try:
+            frame = self._encoder.encode_data(data, self._encrypt_func)
+        except OverflowError as e:
+            self._closed = True
+            raise ConnectionError(
+                f"Sequence number exhausted, reconnect required: {e}"
+            ) from e
         await self._write_frame(frame)
 
     async def recv(self) -> dict:
@@ -698,6 +714,7 @@ class AgentSocket:
         max_stream_size: int = DEFAULT_MAX_STREAM_SIZE,
         on_frame_sent: Optional[Callable] = None,
         on_frame_received: Optional[Callable] = None,
+        max_pending_handshakes: int = 100,
     ) -> "AgentSocketServer":
         """
         Create a server that accepts incoming agent connections.
@@ -712,6 +729,17 @@ class AgentSocket:
             max_stream_size: Maximum stream size in bytes (default 256MB)
             on_frame_sent: Optional callback(frame) for observability
             on_frame_received: Optional callback(frame) for observability
+            max_pending_handshakes: Caps concurrent in-progress (pre-auth)
+                handshakes. asyncio.start_server() spawns an unbounded task
+                per incoming TCP connection with no cap on concurrent
+                pre-handshake connections otherwise -- each HELLO costs one
+                Ed25519 verify + a nonce-registry round-trip before
+                rejection is even possible, so a connection flood is cheap
+                to mount and previously bounded only by FRAME_TIMEOUT_SECONDS
+                and OS file-descriptor limits. Only covers the handshake
+                phase -- released before the connection is handed to your
+                on_connect() handler, so it doesn't limit established
+                connections or how long your handler takes.
 
         Returns an AgentSocketServer -- call .on_connect(handler) then .start().
         """
@@ -725,6 +753,7 @@ class AgentSocket:
             max_stream_size=max_stream_size,
             on_frame_sent=on_frame_sent,
             on_frame_received=on_frame_received,
+            max_pending_handshakes=max_pending_handshakes,
         )
 
 
@@ -749,7 +778,9 @@ class AgentSocketServer:
         max_stream_size: int = DEFAULT_MAX_STREAM_SIZE,
         on_frame_sent: Optional[Callable] = None,
         on_frame_received: Optional[Callable] = None,
+        max_pending_handshakes: int = 100,
     ):
+        self._handshake_semaphore = asyncio.Semaphore(max_pending_handshakes)
         self.passport = passport
         self.signing_key = signing_key
         self.verify_key = verify_key
@@ -835,9 +866,28 @@ class AgentSocketServer:
     ):
         """Handle an incoming connection: handshake then delegate to handler."""
         conn = None
+        handshake_slot_held = False
         try:
             # Clean up stale connections
             self._cleanup_closed()
+
+            # Bound concurrent pre-auth handshakes -- asyncio.start_server()
+            # spawns an unbounded task per incoming TCP connection with no
+            # cap otherwise, and each HELLO costs one Ed25519 verify + a
+            # nonce-registry round-trip before rejection is even possible.
+            # A connection that can't get a slot within one frame-timeout
+            # window is rejected outright rather than queued indefinitely,
+            # since an unbounded queue of waiting tasks is its own resource
+            # problem.
+            try:
+                await asyncio.wait_for(
+                    self._handshake_semaphore.acquire(), timeout=FRAME_TIMEOUT_SECONDS
+                )
+                handshake_slot_held = True
+            except asyncio.TimeoutError:
+                logger.warning("Too many concurrent handshakes in progress, rejecting connection")
+                writer.close()
+                return
 
             # Read HELLO
             length_bytes = await asyncio.wait_for(
@@ -897,6 +947,12 @@ class AgentSocketServer:
             conn.start_keepalive()
             self._connections.append(conn)
 
+            # Handshake is done -- release the slot before handing off to
+            # the (potentially long-running) user handler, so an
+            # established connection never holds up new incoming ones.
+            self._handshake_semaphore.release()
+            handshake_slot_held = False
+
             # Delegate to user handler
             await self._handler(conn)
 
@@ -910,6 +966,8 @@ class AgentSocketServer:
             logger.error(f"Connection error: {e}")
             writer.close()
         finally:
+            if handshake_slot_held:
+                self._handshake_semaphore.release()
             # Clean up if connection was established but handler failed
             if conn and not conn.is_closed:
                 try:
@@ -1160,6 +1218,7 @@ class DirectAgentSocket:
         on_frame_sent: Optional[Callable] = None,
         on_frame_received: Optional[Callable] = None,
         trusted_transport: bool = False,
+        max_pending_handshakes: int = 100,
     ) -> "DirectAgentSocketServer":
         """
         Create a server that accepts incoming DIRECT-mode connections.
@@ -1174,6 +1233,9 @@ class DirectAgentSocket:
         trusted_transport: opt-in, defaults False -- see DirectAgentSocket.connect's
         docstring. Must match what clients pass to connect(), or decode will
         simply fail on garbled payloads (one side encrypting, the other not).
+        max_pending_handshakes: caps concurrent in-progress (pre-auth)
+        handshakes -- see AgentSocketServer.listen's matching parameter for
+        why this exists.
         """
         return DirectAgentSocketServer(
             agent_id=agent_id,
@@ -1189,6 +1251,7 @@ class DirectAgentSocket:
             on_frame_sent=on_frame_sent,
             on_frame_received=on_frame_received,
             trusted_transport=trusted_transport,
+            max_pending_handshakes=max_pending_handshakes,
         )
 
 
@@ -1210,7 +1273,9 @@ class DirectAgentSocketServer:
         on_frame_sent: Optional[Callable] = None,
         on_frame_received: Optional[Callable] = None,
         trusted_transport: bool = False,
+        max_pending_handshakes: int = 100,
     ):
+        self._handshake_semaphore = asyncio.Semaphore(max_pending_handshakes)
         self.agent_id = agent_id
         self.public_key = public_key
         self.signing_key = signing_key
@@ -1280,8 +1345,23 @@ class DirectAgentSocketServer:
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         conn = None
+        handshake_slot_held = False
         try:
             self._cleanup_closed()
+
+            # See AgentSocketServer._handle_client for why this exists --
+            # same bound, same reasoning (RESUME also costs real crypto
+            # work: ticket decryption, single-use check, key derivation, so
+            # it counts against the same pending-handshake limit as HELLO).
+            try:
+                await asyncio.wait_for(
+                    self._handshake_semaphore.acquire(), timeout=FRAME_TIMEOUT_SECONDS
+                )
+                handshake_slot_held = True
+            except asyncio.TimeoutError:
+                logger.warning("Too many concurrent handshakes in progress, rejecting connection")
+                writer.close()
+                return
 
             length_bytes = await asyncio.wait_for(reader.readexactly(4), timeout=FRAME_TIMEOUT_SECONDS)
             first_length = int.from_bytes(length_bytes, "big")
@@ -1302,6 +1382,10 @@ class DirectAgentSocketServer:
 
             conn.start_keepalive()
             self._connections.append(conn)
+
+            self._handshake_semaphore.release()
+            handshake_slot_held = False
+
             await self._handler(conn)
 
         except ValueError as e:
@@ -1314,6 +1398,8 @@ class DirectAgentSocketServer:
             logger.error(f"DIRECT connection error: {e}")
             writer.close()
         finally:
+            if handshake_slot_held:
+                self._handshake_semaphore.release()
             if conn and not conn.is_closed:
                 try:
                     await conn.close()

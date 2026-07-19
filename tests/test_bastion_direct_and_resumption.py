@@ -478,6 +478,134 @@ def test_socket_malformed_data_payload_raises_connection_error():
     asyncio.run(run())
 
 
+def test_socket_max_pending_handshakes_rejects_when_exhausted():
+    """
+    Regression test: asyncio.start_server() spawns an unbounded task per
+    incoming TCP connection with no cap on concurrent pre-handshake
+    connections -- each HELLO costs one Ed25519 verify + a nonce-registry
+    round-trip before rejection is even possible, so a connection flood was
+    cheap to mount against an unauthenticated server with no built-in limit.
+
+    Directly exhausts the server's handshake semaphore (simulating many
+    concurrent in-progress handshakes without needing genuine timing-
+    dependent concurrency) and confirms a new connection attempt is
+    rejected while it's exhausted, then succeeds once a slot frees up.
+    Monkey-patches the module's FRAME_TIMEOUT_SECONDS down so the
+    rejection-wait doesn't make this test slow.
+    """
+    import lastbastion.protocol.socket as socket_module
+
+    async def run():
+        d = tempfile.mkdtemp()
+        store_client = PeerTrustStore(os.path.join(d, "client.json"))
+        store_server = PeerTrustStore(os.path.join(d, "server.json"))
+        pub_c, priv_c = generate_keypair()
+        pub_s, priv_s = generate_keypair()
+
+        async def handle(conn):
+            await conn.close()
+
+        server = DirectAgentSocket.listen(
+            agent_id="server-agent", public_key=pub_s, signing_key=priv_s,
+            trust_store=store_server, port=19319, max_pending_handshakes=1,
+        )
+        server.on_connect(handle)
+        await server.start_background()
+        await asyncio.sleep(0.1)
+
+        original_timeout = socket_module.FRAME_TIMEOUT_SECONDS
+        socket_module.FRAME_TIMEOUT_SECONDS = 0.3
+        try:
+            # Exhaust the single slot directly (simpler and more
+            # deterministic than racing real concurrent connections).
+            await server._handshake_semaphore.acquire()
+
+            rejected = False
+            try:
+                await DirectAgentSocket.connect(
+                    "localhost", agent_id="client-agent", public_key=pub_c,
+                    signing_key=priv_c, trust_store=store_client, port=19319,
+                )
+            except (ConnectionError, OSError, asyncio.TimeoutError):
+                rejected = True
+            assert rejected, "a connection attempt while the handshake limit is exhausted must be rejected"
+
+            # Free the slot -- a subsequent connection must succeed.
+            server._handshake_semaphore.release()
+            conn, _t, _s = await DirectAgentSocket.connect(
+                "localhost", agent_id="client-agent-2", public_key=pub_c,
+                signing_key=priv_c, trust_store=PeerTrustStore(os.path.join(d, "client2.json")),
+                port=19319,
+            )
+            assert conn.peer.agent_id == "server-agent"
+            await conn.close()
+        finally:
+            socket_module.FRAME_TIMEOUT_SECONDS = original_timeout
+            await server.stop()
+
+    asyncio.run(run())
+
+
+def test_socket_send_normalizes_sequence_overflow_to_connection_error():
+    """
+    Regression test: send() used to let FrameEncoder.encode_data()'s bare
+    OverflowError (raised once a connection's sequence number hits
+    MAX_SEQUENCE, 2^32-1) propagate directly -- every documented error-
+    handling pattern in AgentConnection shows catching ConnectionError
+    only, so a caller following that pattern would not catch this. A
+    reconnect is required either way (same remediation as any other
+    "connection no longer usable" case), so it's normalized the same way.
+
+    Forces the encoder's sequence counter to MAX_SEQUENCE directly rather
+    than sending 2^32 real frames.
+    """
+    from lastbastion.protocol.frames import MAX_SEQUENCE
+
+    async def run():
+        d = tempfile.mkdtemp()
+        store_client = PeerTrustStore(os.path.join(d, "client.json"))
+        store_server = PeerTrustStore(os.path.join(d, "server.json"))
+        pub_c, priv_c = generate_keypair()
+        pub_s, priv_s = generate_keypair()
+
+        async def handle(conn):
+            try:
+                await conn.recv()
+            except Exception:
+                pass
+            await conn.close()
+
+        server = DirectAgentSocket.listen(
+            agent_id="server-agent", public_key=pub_s, signing_key=priv_s,
+            trust_store=store_server, port=19318,
+        )
+        server.on_connect(handle)
+        await server.start_background()
+        await asyncio.sleep(0.1)
+
+        try:
+            conn, _t, _s = await DirectAgentSocket.connect(
+                "localhost", agent_id="client-agent", public_key=pub_c,
+                signing_key=priv_c, trust_store=store_client, port=19318,
+            )
+            conn._encoder._sequence = MAX_SEQUENCE + 1  # force exhaustion
+
+            raised = False
+            try:
+                await conn.send({"this": "should not go through"})
+            except ConnectionError as e:
+                raised = True
+                assert "econnect" in str(e) or "Sequence" in str(e)
+            except OverflowError:
+                raised = False  # explicitly the wrong type -- fail the assert below
+            assert raised, "sequence exhaustion must raise ConnectionError, not a bare OverflowError"
+            assert conn.is_closed, "the connection should be marked closed after exhaustion"
+        finally:
+            await server.stop()
+
+    asyncio.run(run())
+
+
 def test_socket_fresh_handshake_and_data_exchange():
     async def run():
         d = tempfile.mkdtemp()
