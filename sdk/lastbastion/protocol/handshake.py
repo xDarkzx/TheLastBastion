@@ -58,7 +58,7 @@ NONCE_CACHE_MAX = 10_000
 # ---------------------------------------------------------------------------
 
 class NonceRegistry:
-    """Seen-nonce tracker. Rejects duplicate nonces within the freshness
+    """Seen-nonce tracker. Rejects duplicate nonces within the retention
     window to prevent replay attacks across different responders.
 
     Backed by Redis when available (SET NX EX — atomic, shared across every
@@ -67,12 +67,24 @@ class NonceRegistry:
     Police / AgentSocket process: a nonce seen by process A is invisible to
     process B, so replay protection silently stops working across replicas.
 
-    Nonces older than HANDSHAKE_FRESHNESS_SECONDS are automatically purged.
+    ttl_seconds controls how long a seen value is remembered before being
+    purged and becoming replayable again. The 30s default is correct for
+    handshake nonces (HANDSHAKE_FRESHNESS_SECONDS -- a HELLO is only ever
+    valid within that freshness window anyway, so nothing is lost by
+    forgetting it after 30s). It is WRONG for anything with a longer natural
+    lifetime -- e.g. session-resumption ticket IDs, which stay redeemable
+    for DEFAULT_TICKET_TTL_SECONDS (1 hour) in resumption.py. Using the 30s
+    default there meant a ticket was only actually protected against replay
+    for the first 30 seconds after redemption, then silently became
+    replayable again for the remaining ~59 minutes of its life with no
+    private key needed -- ResumptionResponder now passes a TTL matching the
+    ticket lifetime instead of relying on this default.
     """
 
-    def __init__(self, max_size: int = NONCE_CACHE_MAX):
+    def __init__(self, max_size: int = NONCE_CACHE_MAX, ttl_seconds: int = HANDSHAKE_FRESHNESS_SECONDS):
         self._seen: dict[bytes, float] = {}  # nonce → timestamp (in-memory fallback)
         self._max_size = max_size
+        self._ttl_seconds = ttl_seconds
         self._lock = threading.Lock()
         self._redis = None
         self._redis_prefix = "bastion:handshake_nonce:"
@@ -97,7 +109,7 @@ class NonceRegistry:
         if self._redis:
             try:
                 key = self._redis_prefix + nonce.hex()
-                was_set = self._redis.set(key, "1", nx=True, ex=HANDSHAKE_FRESHNESS_SECONDS)
+                was_set = self._redis.set(key, "1", nx=True, ex=self._ttl_seconds)
                 return bool(was_set)
             except Exception:
                 pass  # Redis hiccup — fall through to in-memory for this call
@@ -117,8 +129,8 @@ class NonceRegistry:
             return True
 
     def _purge_expired(self):
-        """Remove nonces older than freshness window. Caller must hold _lock."""
-        cutoff = time.time() - HANDSHAKE_FRESHNESS_SECONDS
+        """Remove nonces older than the retention window. Caller must hold _lock."""
+        cutoff = time.time() - self._ttl_seconds
         expired = [n for n, t in self._seen.items() if t < cutoff]
         for n in expired:
             del self._seen[n]
@@ -128,7 +140,11 @@ class NonceRegistry:
             return len(self._seen)
 
 
-# Global nonce registry (shared across all responders in the same process)
+# Global nonce registry (shared across all responders in the same process).
+# TTL matches HANDSHAKE_FRESHNESS_SECONDS -- only appropriate for handshake
+# nonces. Do NOT reuse this instance for ticket single-use tracking (see
+# NonceRegistry's docstring); ResumptionResponder builds its own dedicated
+# instance with a TTL matching the actual ticket lifetime.
 _global_nonce_registry = NonceRegistry()
 
 
@@ -431,7 +447,12 @@ class HandshakeResponder:
         self.verify_key = verify_key
         self.min_trust_score = min_trust_score
         self.ephemeral = generate_ephemeral_keypair()
-        self._nonce_registry = nonce_registry or _global_nonce_registry
+        # `nonce_registry or _global_nonce_registry` looks right but silently
+        # discards a caller-supplied registry whenever it's falsy -- and
+        # NonceRegistry defines __len__, so any *freshly constructed* (empty)
+        # registry passed in here is falsy and gets replaced by the global
+        # one, defeating the entire point of passing a dedicated instance.
+        self._nonce_registry = nonce_registry if nonce_registry is not None else _global_nonce_registry
 
     def process_hello(self, hello_frame: BastionFrame) -> Tuple[BastionFrame, HandshakeResult]:
         """
@@ -723,7 +744,10 @@ class DirectHandshakeResponder:
         self.signing_key = signing_key
         self.trust_store = trust_store
         self.ephemeral = generate_ephemeral_keypair()
-        self._nonce_registry = nonce_registry or _global_nonce_registry
+        # See HandshakeResponder's __init__ for why this must be `is not
+        # None`, not `or` -- a freshly-constructed (empty) NonceRegistry is
+        # falsy (it defines __len__) and `or` would silently discard it.
+        self._nonce_registry = nonce_registry if nonce_registry is not None else _global_nonce_registry
         self.ticket_key = ticket_key
 
     def process_hello(
@@ -857,13 +881,20 @@ class ResumptionResponder:
         ticket_key: bytes,
         nonce_registry: Optional[NonceRegistry] = None,
         revocation_check=None,
+        ticket_ttl_seconds: Optional[int] = None,
     ):
         """
         Args:
             ticket_key: This server's symmetric ticket-encryption key
-            nonce_registry: Optional NonceRegistry for single-use enforcement
-                (uses global if not provided — pass a dedicated one to keep
-                ticket IDs and handshake nonces in separate namespaces)
+            nonce_registry: Optional NonceRegistry for single-use enforcement.
+                If not provided, a DEDICATED registry is built (never the
+                30s-TTL global handshake-nonce registry -- reusing that one
+                here meant a redeemed ticket was only actually protected
+                against replay for 30 seconds, then silently replayable again
+                for the rest of its ~1 hour life with no private key needed).
+                If you pass your own registry explicitly, size its ttl_seconds
+                to match (or exceed) whatever ttl_seconds you pass to
+                issue_ticket() -- a shorter TTL here reopens the same hole.
             revocation_check: Optional callable(agent_id) -> bool, True if
                 agent_id is currently revoked. A resumed session skips full
                 passport/trust re-verification by design, so if you need live
@@ -871,9 +902,20 @@ class ResumptionResponder:
                 handshakes), wire it here. Kept as a pluggable callback rather
                 than importing a specific app's DB layer directly, since the
                 SDK itself has no opinion on where revocation state lives.
+            ticket_ttl_seconds: Must match the ttl_seconds this server's
+                issue_ticket() calls use (defaults to
+                resumption.DEFAULT_TICKET_TTL_SECONDS, same as issue_ticket's
+                own default). Only used to size the dedicated registry's
+                retention window when nonce_registry isn't provided.
         """
+        from lastbastion.protocol.resumption import DEFAULT_TICKET_TTL_SECONDS
+
         self.ticket_key = ticket_key
-        self._nonce_registry = nonce_registry or _global_nonce_registry
+        # `is not None`, not `or` -- see HandshakeResponder.__init__ for why:
+        # a freshly-constructed (empty) NonceRegistry is falsy.
+        self._nonce_registry = nonce_registry if nonce_registry is not None else NonceRegistry(
+            ttl_seconds=ticket_ttl_seconds or DEFAULT_TICKET_TTL_SECONDS,
+        )
         self.revocation_check = revocation_check
         if revocation_check is None:
             logging.getLogger("BastionResumption").warning(

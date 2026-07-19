@@ -240,6 +240,79 @@ def test_resumption_rotated_ticket_works_next_time():
     assert result2.peer_agent_id == "agent-a"
 
 
+def test_resumption_ticket_replay_rejected_after_handshake_freshness_window():
+    """
+    Regression test for a real vulnerability: ResumptionResponder used to
+    default to the *global* NonceRegistry, whose purge window is
+    HANDSHAKE_FRESHNESS_SECONDS (30s) -- correct for handshake nonces, wrong
+    for ticket IDs, which stay valid for DEFAULT_TICKET_TTL_SECONDS (1 hour).
+    A captured ticket was replayable for ~59 minutes after the first 30
+    seconds, no private key needed. test_resumption_ticket_is_single_use
+    replays immediately and would pass either way -- it never exercised the
+    window this test specifically targets.
+
+    Builds a ResumptionResponder with NO explicit nonce_registry (so it
+    builds its own default -- exactly the vulnerable path), redeems a
+    ticket, fast-forwards the registry's internal clock past the old 30s
+    window while staying well inside the ticket's real 1-hour lifetime, and
+    asserts the replay is still rejected.
+    """
+    ticket_key = os.urandom(32)
+    rs = derive_resumption_secret(os.urandom(32))
+    ticket = issue_ticket(ticket_key, "agent-a", "pub-a-hex", rs)
+
+    responder = ResumptionResponder(ticket_key)  # no nonce_registry -- uses the default path
+
+    # Force the in-memory fallback path deterministically -- if Redis
+    # happens to be reachable in whatever environment runs this test, the
+    # registry would silently use SET NX EX instead, and the manual
+    # timestamp manipulation below would be a no-op against real Redis TTLs
+    # (verified this happens: this exact test initially "passed" for the
+    # wrong reason when Redis was running locally, testing nothing).
+    registry = responder._nonce_registry
+    registry._redis = None
+
+    frame1 = build_resume(ticket, os.urandom(32))
+    responder.process_resume(frame1)  # first redemption succeeds
+
+    # Fast-forward the registry's internal clock past the OLD 30s window
+    # (the bug) while staying inside the ticket's real ~3600s lifetime.
+    for nonce, ts in list(registry._seen.items()):
+        registry._seen[nonce] = ts - 40  # simulate 40s elapsed
+
+    frame2 = build_resume(ticket, os.urandom(32))  # same ticket, replayed
+    raised = False
+    try:
+        responder.process_resume(frame2)
+    except ValueError as e:
+        raised = True
+        assert "TICKET_REPLAYED" in str(e)
+    assert raised, "a replayed ticket must still be rejected 40s later, well inside its real TTL"
+
+
+def test_resumption_responder_uses_explicitly_passed_empty_registry():
+    """
+    Regression test for a real bug found while writing the replay-window
+    test above: ResumptionResponder.__init__ used
+    `self._nonce_registry = nonce_registry or NonceRegistry(...)`. Python
+    falls back to `or`'s right side whenever the left side is falsy --
+    and NonceRegistry defines __len__, so a FRESHLY CONSTRUCTED (therefore
+    empty, therefore falsy) registry passed in explicitly was silently
+    discarded and replaced by a brand-new internal one. Any caller who did
+    the documented "pass a dedicated registry" pattern got ignored with no
+    error. Asserts the exact registry object passed in is the one actually
+    used, via identity comparison.
+    """
+    ticket_key = os.urandom(32)
+    my_registry = NonceRegistry()  # freshly constructed -- empty, therefore falsy
+    assert bool(my_registry) is False, "sanity check: an empty NonceRegistry is falsy"
+
+    responder = ResumptionResponder(ticket_key, nonce_registry=my_registry)
+    assert responder._nonce_registry is my_registry, (
+        "an explicitly-passed registry must be used as-is, even when empty"
+    )
+
+
 def test_resumption_expired_ticket_rejected():
     ticket_key = os.urandom(32)
     rs = derive_resumption_secret(os.urandom(32))
