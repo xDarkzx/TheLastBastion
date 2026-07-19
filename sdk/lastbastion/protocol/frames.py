@@ -45,7 +45,6 @@ except ImportError:
 try:
     from nacl.signing import SigningKey, VerifyKey
     from nacl.encoding import HexEncoder
-    from nacl.exceptions import BadSignatureError
 except ImportError:
     raise ImportError(
         "Bastion Protocol requires PyNaCl for Ed25519 signing. "
@@ -615,10 +614,21 @@ class FrameDecoder:
     def _verify_signature(self, frame: BastionFrame) -> bool:
         """Verify frame signature with peer's Ed25519 public key."""
         if not self._verify_key:
-            return True
+            # Fail closed, not open. The only current call site already
+            # guards with `if self._verify_key:` before calling this, so
+            # this branch is unreachable today -- but a future refactor or
+            # any direct call to _verify_signature() bypassing that guard
+            # would previously have silently accepted ANY signature as
+            # valid with no key to check it against. No key means no
+            # verification is possible, which must mean "not verified",
+            # not "verified."
+            return False
         try:
             vk = VerifyKey(bytes.fromhex(self._verify_key))
             vk.verify(frame.signable_bytes, frame.signature)
             return True
-        except (BadSignatureError, Exception):
+        except Exception:
+            # BadSignatureError is itself an Exception subclass, so listing
+            # it separately alongside bare Exception was dead/misleading --
+            # this already caught everything BadSignatureError would.
             return False

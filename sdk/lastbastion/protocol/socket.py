@@ -441,7 +441,10 @@ class AgentConnection:
                     self._read_frame_raw(), timeout=2.0
                 )
                 # Peer sent CLOSE back -- clean shutdown
-            except (asyncio.TimeoutError, ConnectionError, Exception):
+            except Exception:
+                # Covers asyncio.TimeoutError and ConnectionError among
+                # others -- both are Exception subclasses, so listing them
+                # alongside bare Exception was dead/misleading.
                 pass  # Peer didn't respond, proceed with teardown
         except Exception:
             pass
@@ -759,6 +762,7 @@ class AgentSocketServer:
         self._connections: List[AgentConnection] = []
         self._on_frame_sent = on_frame_sent
         self._on_frame_received = on_frame_received
+        self._cleanup_task: Optional[asyncio.Task] = None
 
     def on_connect(self, handler: Callable[[AgentConnection], Coroutine]):
         """Register a handler called for each new authenticated connection."""
@@ -769,6 +773,21 @@ class AgentSocketServer:
         """Count of currently active (non-closed) connections."""
         return sum(1 for c in self._connections if not c.is_closed)
 
+    # How often the background sweep removes closed connections from
+    # _connections, independent of new connections arriving. Cleanup used
+    # to run ONLY at the start of handling the next incoming connection --
+    # a server that went idle after handling many short-lived connections
+    # kept every closed AgentConnection (and its reader/writer references)
+    # in memory indefinitely until another connection happened to arrive.
+    # Bounded by eventual churn, not a true unbounded leak, but not what
+    # "robust under bursty-then-idle traffic" should look like either.
+    _CLEANUP_INTERVAL_SECONDS = 30.0
+
+    async def _periodic_cleanup_loop(self):
+        while True:
+            await asyncio.sleep(self._CLEANUP_INTERVAL_SECONDS)
+            self._cleanup_closed()
+
     async def start(self):
         """Start listening. Blocks until server is closed."""
         if not self._handler:
@@ -777,6 +796,7 @@ class AgentSocketServer:
         self._server = await asyncio.start_server(
             self._handle_client, self.host, self.port
         )
+        self._cleanup_task = asyncio.ensure_future(self._periodic_cleanup_loop())
         logger.info(f"Bastion Protocol server listening on {self.host}:{self.port}")
 
         async with self._server:
@@ -790,10 +810,13 @@ class AgentSocketServer:
         self._server = await asyncio.start_server(
             self._handle_client, self.host, self.port
         )
+        self._cleanup_task = asyncio.ensure_future(self._periodic_cleanup_loop())
         logger.info(f"Bastion Protocol server listening on {self.host}:{self.port}")
 
     async def stop(self):
         """Stop the server and close all connections."""
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -1208,6 +1231,7 @@ class DirectAgentSocketServer:
             ResumptionResponder(ticket_key, revocation_check=revocation_check)
             if ticket_key is not None else None
         )
+        self._cleanup_task: Optional[asyncio.Task] = None
 
     def on_connect(self, handler: Callable[[AgentConnection], Coroutine]):
         self._handler = handler
@@ -1216,10 +1240,20 @@ class DirectAgentSocketServer:
     def active_connections(self) -> int:
         return sum(1 for c in self._connections if not c.is_closed)
 
+    # See AgentSocketServer's matching constant/loop for why this exists --
+    # same bug, same fix, this class just duplicates the server structure.
+    _CLEANUP_INTERVAL_SECONDS = 30.0
+
+    async def _periodic_cleanup_loop(self):
+        while True:
+            await asyncio.sleep(self._CLEANUP_INTERVAL_SECONDS)
+            self._cleanup_closed()
+
     async def start(self):
         if not self._handler:
             raise RuntimeError("No handler registered -- call .on_connect() first")
         self._server = await asyncio.start_server(self._handle_client, self.host, self.port)
+        self._cleanup_task = asyncio.ensure_future(self._periodic_cleanup_loop())
         logger.info(f"Bastion Protocol (DIRECT) server listening on {self.host}:{self.port}")
         async with self._server:
             await self._server.serve_forever()
@@ -1228,9 +1262,12 @@ class DirectAgentSocketServer:
         if not self._handler:
             raise RuntimeError("No handler registered -- call .on_connect() first")
         self._server = await asyncio.start_server(self._handle_client, self.host, self.port)
+        self._cleanup_task = asyncio.ensure_future(self._periodic_cleanup_loop())
         logger.info(f"Bastion Protocol (DIRECT) server listening on {self.host}:{self.port}")
 
     async def stop(self):
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
         if self._server:
             self._server.close()
             await self._server.wait_closed()
