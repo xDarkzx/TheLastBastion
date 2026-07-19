@@ -1,6 +1,5 @@
 """Pydantic models for SDK request/response types."""
 
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
@@ -35,10 +34,6 @@ class HandoffRequest(BaseModel):
 class StartSessionRequest(BaseModel):
     agent_id: str
     config: Dict[str, Any] = Field(default_factory=dict)
-
-
-class RunAttacksRequest(BaseModel):
-    attack_types: List[str] = Field(default_factory=list)
 
 
 class IssuePassportRequest(BaseModel):

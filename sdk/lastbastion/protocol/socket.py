@@ -25,9 +25,8 @@ import asyncio
 import hashlib
 import logging
 import time
-import weakref
-from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Callable, Coroutine, List, Optional
 
 from lastbastion.passport import AgentPassport
 from lastbastion.protocol.frames import (
@@ -42,7 +41,6 @@ from lastbastion.protocol.frames import (
     MAX_FRAME_SIZE,
     FRAME_TIMEOUT_SECONDS,
     PING_INTERVAL_SECONDS,
-    PING_TIMEOUT_SECONDS,
     serialize_payload,
     deserialize_payload,
     compute_passport_hash,
@@ -50,7 +48,6 @@ from lastbastion.protocol.frames import (
 from lastbastion.protocol.handshake import (
     HandshakeInitiator,
     HandshakeResponder,
-    HandshakeResult,
     SessionKeys,
     DirectHandshakeInitiator,
     DirectHandshakeResponder,
@@ -451,9 +448,10 @@ class AgentConnection:
         try:
             close_frame = self._encoder.encode_close(self._encrypt_func)
             await self._write_frame_raw(close_frame)
-            # Wait briefly for peer's CLOSE response
+            # Wait briefly for peer's CLOSE response (contents unused -- we
+            # only care that the peer acknowledged, not what it sent back)
             try:
-                peer_close = await asyncio.wait_for(
+                await asyncio.wait_for(
                     self._read_frame_raw(), timeout=2.0
                 )
                 # Peer sent CLOSE back -- clean shutdown

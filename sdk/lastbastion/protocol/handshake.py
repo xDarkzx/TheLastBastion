@@ -15,11 +15,10 @@ Hard dependencies: pynacl (X25519 DH + SecretBox encryption), msgpack.
 
 import os
 import time
-import hashlib
 import logging
 import threading
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, Set
+from typing import Optional, Tuple
 
 from lastbastion.protocol.frames import (
     BastionFrame,
@@ -38,7 +37,6 @@ from lastbastion.crypto import verify_signature_raw
 try:
     from nacl.public import PrivateKey as X25519PrivateKey, PublicKey as X25519PublicKey, Box
     from nacl.secret import SecretBox
-    from nacl.utils import random as nacl_random
 except ImportError:
     raise ImportError(
         "Bastion Protocol requires PyNaCl for X25519 DH and SecretBox encryption. "

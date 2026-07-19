@@ -18,7 +18,7 @@ import asyncio
 import json
 from pydantic import BaseModel
 from typing import Set
-from datetime import datetime, timedelta
+from datetime import datetime
 from core.database import (
     init_db, SessionLocal,
     resolve_quarantine, get_refinery_stats,
@@ -258,6 +258,32 @@ async def refinery_feed(websocket: WebSocket):
         _ws_clients.discard(websocket)
 
 
+_bg_task_logger = logging.getLogger("BackgroundTask")
+
+
+def _spawn_background_task(coro, name: str) -> asyncio.Task:
+    """
+    asyncio.create_task() fire-and-forget: if the coroutine raises anywhere
+    that isn't already caught internally, the task just stops forever with
+    no application-visible sign of it -- the exception only ever surfaces as
+    a low-level "Task exception was never retrieved" warning when the task
+    object happens to get garbage-collected, which is easy to miss entirely.
+    This wraps agent_network.start()/research_arena.start()/trust_decay_loop()
+    so a crash is at least logged with a name and traceback.
+    """
+    task = asyncio.create_task(coro)
+
+    def _log_if_crashed(t: asyncio.Task) -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            _bg_task_logger.error(f"{name}: background task crashed", exc_info=exc)
+
+    task.add_done_callback(_log_if_crashed)
+    return task
+
+
 async def trust_decay_loop():
     """
     Background task: decays trust for inactive agents.
@@ -299,7 +325,7 @@ async def trust_decay_loop():
                 new_score = max(0.0, current_score - decay)
 
                 if new_score < current_score:
-                    apply_trust_decay(agent_id, new_score, f"Inactivity decay: {inactive_days} days idle")
+                    apply_trust_decay(agent_id, new_score, f"Inactivity decay: {inactivity_days} days idle")
 
                     # Auto-revoke if below NEW threshold
                     if new_score < 0.40:
@@ -431,17 +457,17 @@ async def startup_event():
     except Exception as e:
         print(f"STARTUP: WebSocket wiring skipped: {e}")
     # Start the live A2A agent network (real agents on ports 9001-9004)
-    asyncio.create_task(agent_network.start())
+    _spawn_background_task(agent_network.start(), "AGENT_NETWORK")
     # Start the adversarial research loop (Red/Blue team, runs continuously)
     try:
         import core.research_loop as _rl
         _rl.research_arena = _rl.ResearchArena()
-        asyncio.create_task(_rl.research_arena.start())
+        _spawn_background_task(_rl.research_arena.start(), "RESEARCH_ARENA")
         print("STARTUP: Adversarial research loop initialized")
     except Exception as e:
         print(f"STARTUP: Research loop skipped: {e}")
     # Start trust decay background loop (Phase E)
-    asyncio.create_task(trust_decay_loop())
+    _spawn_background_task(trust_decay_loop(), "TRUST_DECAY_LOOP")
     _decay_mode = "DEMO (5-min cycles)" if os.environ.get("DEMO_DECAY_MODE", "0") == "1" else "normal (hourly)"
     print(f"STARTUP: Trust decay loop initialized ({_decay_mode})")
 

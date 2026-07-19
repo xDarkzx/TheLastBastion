@@ -14,7 +14,7 @@ import hashlib
 import json
 import time
 import base64
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any
 
 # Hard dependency — no silent fallback. Fail at import, not at runtime.
 try:

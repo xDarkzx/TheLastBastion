@@ -25,7 +25,6 @@ from typing import Any, Callable, Dict, Optional
 
 from lastbastion.passport import AgentPassport, PassportVerifier
 from lastbastion.models import GatewayDecision
-from lastbastion.exceptions import GatewayDeniedError
 
 
 TRUST_LEVELS_ORDERED = ["NONE", "NEW", "BASIC", "VERIFIED", "ESTABLISHED", "GOLD"]
@@ -469,7 +468,16 @@ class LastBastionGateway:
 
     def create_middleware(self):
         """
-        Create a Starlette/FastAPI middleware class.
+        Create a Starlette/FastAPI middleware class bound to this gateway
+        instance (its config, cache, and budget tracker).
+
+        Not the same class as lastbastion.middleware.LastBastionMiddleware --
+        that one is standalone and builds its own config from constructor
+        kwargs. This one is a closure over an already-configured gateway, for
+        callers who already have a LastBastionGateway they want to reuse
+        (e.g. to share its budget tracker across multiple middleware-mounted
+        apps). Deliberately named differently so the two never look
+        interchangeable in a stack trace or `type(x).__name__`.
 
         Usage:
             app.add_middleware(gateway.create_middleware())
@@ -479,7 +487,7 @@ class LastBastionGateway:
         from starlette.middleware.base import BaseHTTPMiddleware
         from starlette.responses import JSONResponse
 
-        class LastBastionMiddleware(BaseHTTPMiddleware):
+        class _GatewayBoundMiddleware(BaseHTTPMiddleware):
             async def dispatch(self, request, call_next):
                 jwt_token = _extract_passport_from_request(request)
                 decision = await gateway.check_agent(jwt_token, request)
@@ -503,7 +511,7 @@ class LastBastionGateway:
                 }
                 return await call_next(request)
 
-        return LastBastionMiddleware
+        return _GatewayBoundMiddleware
 
 
 def _extract_passport_from_request(request) -> str:

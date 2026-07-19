@@ -11,7 +11,7 @@ Usage:
     # Mount in your MCP server — agents can now call these tools
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 
 def create_lastbastion_mcp(

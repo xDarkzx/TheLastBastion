@@ -14,12 +14,11 @@ Five defect types:
 """
 
 import json
-import os
 import time
 import uuid
-from typing import Dict, Tuple
+from typing import Dict
 
-from lastbastion.crypto import generate_keypair, sign_bytes
+from lastbastion.crypto import generate_keypair
 from lastbastion.passport import AgentPassport, generate_runtime_fingerprint
 
 

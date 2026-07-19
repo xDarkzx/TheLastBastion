@@ -40,7 +40,6 @@ from lastbastion.exceptions import (
     ValidationError,
     PassportError,
 )
-from lastbastion.passport import AgentPassport
 
 
 class LastBastionClient:
@@ -579,8 +578,9 @@ class LastBastionClient:
             from lastbastion.crypto import generate_keypair
             public_key, private_key = generate_keypair()
 
-        # Step 1: Register with automatic challenge signing
-        reg = await self.register_with_keypair(
+        # Step 1: Register with automatic challenge signing (side effect:
+        # updates self.api_key/api_secret, consumed implicitly by verify_agent below)
+        await self.register_with_keypair(
             agent_id=agent_id,
             public_key=public_key,
             private_key=private_key,

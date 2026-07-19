@@ -27,8 +27,7 @@ import struct
 import hashlib
 import time
 from enum import IntEnum, IntFlag
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
 # Hard dependencies -- no silent fallbacks
@@ -44,7 +43,6 @@ except ImportError:
 
 try:
     from nacl.signing import SigningKey, VerifyKey
-    from nacl.encoding import HexEncoder
 except ImportError:
     raise ImportError(
         "Bastion Protocol requires PyNaCl for Ed25519 signing. "

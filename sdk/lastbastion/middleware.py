@@ -14,7 +14,7 @@ For simpler integration when you don't need the full Gateway object:
 
 import time
 import hashlib
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -212,7 +212,7 @@ class LastBastionMiddleware(BaseHTTPMiddleware):
                 "post_exhaustion_strikes": strikes,
                 "escalation_tier": escalation_tier,
                 "message": f"Budget exhausted. Strike {strikes}/30."
-                           + (f" File an appeal at /m2m/appeal." if strikes >= 5 else " Re-verify with The Last Bastion."),
+                           + (" File an appeal at /m2m/appeal." if strikes >= 5 else " Re-verify with The Last Bastion."),
             }
             if strikes >= 5:
                 content["appeal_url"] = "/m2m/appeal"
