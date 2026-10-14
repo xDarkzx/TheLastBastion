@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: bastion
+          POSTGRES_PASSWORD: ci-only
+          POSTGRES_DB: bastion
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U bastion"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://bastion:ci-only@127.0.0.1:5432/bastion
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt pytest pytest-asyncio pip-audit
+      - name: Dependency audit
+        run: pip-audit -r requirements.txt
+      - run: pytest -q
+
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm audit --audit-level=high
+      - run: npm run build
