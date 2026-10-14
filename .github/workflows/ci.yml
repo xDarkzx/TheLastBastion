@@ -26,7 +26,7 @@ jobs:
     env:
       DATABASE_URL: postgresql://bastion:ci-only@127.0.0.1:5432/bastion
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -43,7 +43,7 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 22
