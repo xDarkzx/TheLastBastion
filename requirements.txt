@@ -20,7 +20,7 @@ redis==5.0.1
 
 # HTTP Clients (async)
 aiohttp>=3.14.3
-httpx>=0.26.0
+httpx>=0.28.1
 
 # Document Intelligence (PDF + Excel + Word + Image analysis)
 Pillow>=10.0.0
