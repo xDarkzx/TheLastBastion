@@ -13,7 +13,7 @@ python-dotenv>=1.2.2
 
 # Database (PostgreSQL)
 sqlalchemy==2.0.25
-psycopg2-binary==2.9.9
+psycopg2-binary==2.9.13
 
 # Redis (task queues, pub/sub, hot cache)
 redis==5.0.1
