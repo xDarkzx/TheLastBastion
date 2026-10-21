@@ -33,7 +33,7 @@ scipy>=1.11.0
 reportlab>=4.0
 
 # Playbook Engine (API extraction + scheduling)
-jmespath==1.0.1
+jmespath==1.1.0
 croniter==1.4.1
 
 # A2A Protocol (agent-to-agent communication)
