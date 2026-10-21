@@ -19,7 +19,7 @@ psycopg2-binary==2.9.9
 redis==5.0.1
 
 # HTTP Clients (async)
-aiohttp>=3.14.3
+aiohttp>=3.14.5
 httpx>=0.26.0
 
 # Document Intelligence (PDF + Excel + Word + Image analysis)
